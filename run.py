@@ -59,7 +59,8 @@ def load_and_evaluate_model(cfg, dataset, checkpoint_path):
 
 def train(cfg,dataset,shared_metrics,tune=False):
 
-    tb_logger = TensorBoardLogger('./logger_DTI/tb_logs', name=cfg['logger']['name'])
+    tensorboard_root = os.environ.get("TENSORBOARD_LOG_DIR", "./logger_DTI/tb_logs")
+    tb_logger = TensorBoardLogger(tensorboard_root, name=cfg['logger']['name'])
     
     # Init datamodule
     data_module: LightningModule = hydra.utils.instantiate(

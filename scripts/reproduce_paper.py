@@ -301,7 +301,7 @@ def parse_args() -> argparse.Namespace:
         "--artifacts-dir",
         type=Path,
         default=REPO_ROOT / "artifacts" / "paper_reproduction",
-        help="Directory for checkpoints, captured logs, and summary files.",
+        help="Directory for checkpoints, captured logs, Hydra outputs, and summary files.",
     )
     parser.add_argument(
         "--serialized-dir",
