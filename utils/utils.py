@@ -52,17 +52,22 @@ def get_dataset(cfg,X_drug, X_target, DTI,ddi=None,skipped=None):
         dataset = pre_split(X_drug,X_target,DTI,ddi,skipped)
     return dataset
 
-def new_balancing(y,ratio=1):
+def new_balancing(y, ratio=1, rng=None):
+    if rng is None:
+        rng = np.random
     ind_1 = np.where(y.label==1)[0]
     ind_0 = np.where(y.label==0)[0]
     if len(ind_0) > ratio*len(ind_1):
-        ind_0 = np.random.choice(ind_0,ratio*len(ind_1),replace=False)
+        ind_0 = rng.choice(ind_0, ratio*len(ind_1), replace=False)
     ind = np.concatenate((ind_1,ind_0))
-    np.random.shuffle(ind)
+    rng.shuffle(ind)
     y = y.iloc[ind]
     return y  
 
 def split(config,X_drug,X_target,y,ddi,skipped):
+    split_seed = config.get('seed')
+    rng = np.random.RandomState(split_seed) if split_seed is not None else np.random
+
     #add rows and columns at skipped index with all 0
     if skipped:
         for i in skipped:
@@ -148,34 +153,61 @@ def split(config,X_drug,X_target,y,ddi,skipped):
 
     if config['splitting_strategy'] == 'random':
 
-        train_val_ind, test_ind = train_test_split(np.arange(len(y)), test_size=config['ratio'][2])
-        train_ind, val_ind = train_test_split(train_val_ind, test_size=config['ratio'][1])
+        train_val_ind, test_ind = train_test_split(
+            np.arange(len(y)),
+            test_size=config['ratio'][2],
+            random_state=split_seed,
+        )
+        val_seed = None if split_seed is None else split_seed + 1
+        train_ind, val_ind = train_test_split(
+            train_val_ind,
+            test_size=config['ratio'][1],
+            random_state=val_seed,
+        )
         train_ind = y.iloc[train_ind]
         val_ind = y.iloc[val_ind]
         test_ind = y.iloc[test_ind]      
     
     elif config['splitting_strategy'] == 'cold_drug':
-        train_val_drug, test_drug = train_test_split(np.arange(len(np.unique(y.Drug_ID))), test_size=config['ratio'][2])
-        train_drug, val_drug = train_test_split(train_val_drug, test_size=config['ratio'][1])
+        train_val_drug, test_drug = train_test_split(
+            np.arange(len(np.unique(y.Drug_ID))),
+            test_size=config['ratio'][2],
+            random_state=split_seed,
+        )
+        val_seed = None if split_seed is None else split_seed + 1
+        train_drug, val_drug = train_test_split(
+            train_val_drug,
+            test_size=config['ratio'][1],
+            random_state=val_seed,
+        )
         train_ind = y[y['Drug_ID'].isin(train_drug)]
         val_ind = y[y['Drug_ID'].isin(val_drug)]
         test_ind = y[y['Drug_ID'].isin(test_drug)]
 
     elif config['splitting_strategy'] == 'cold_target':
-        train_val_target, test_target = train_test_split(np.arange(len(np.unique(y.Prot_ID))), test_size=config['ratio'][2])
-        train_target, val_target = train_test_split(train_val_target, test_size=config['ratio'][1])
+        train_val_target, test_target = train_test_split(
+            np.arange(len(np.unique(y.Prot_ID))),
+            test_size=config['ratio'][2],
+            random_state=split_seed,
+        )
+        val_seed = None if split_seed is None else split_seed + 1
+        train_target, val_target = train_test_split(
+            train_val_target,
+            test_size=config['ratio'][1],
+            random_state=val_seed,
+        )
         train_ind = y[y['Prot_ID'].isin(train_target)]
         val_ind = y[y['Prot_ID'].isin(val_target)]
         test_ind = y[y['Prot_ID'].isin(test_target)]
 
     if config['balanced']:
-        train_ind = new_balancing(train_ind)
-        val_ind = new_balancing(val_ind)
-        test_ind = new_balancing(test_ind)
+        train_ind = new_balancing(train_ind, rng=rng)
+        val_ind = new_balancing(val_ind, rng=rng)
+        test_ind = new_balancing(test_ind, rng=rng)
     elif config['unbalanced_ratio']:
-        train_ind = new_balancing(train_ind,config['unbalanced_ratio'])
-        val_ind = new_balancing(val_ind,config['unbalanced_ratio'])
-        test_ind = new_balancing(test_ind,config['unbalanced_ratio'])
+        train_ind = new_balancing(train_ind, config['unbalanced_ratio'], rng=rng)
+        val_ind = new_balancing(val_ind, config['unbalanced_ratio'], rng=rng)
+        test_ind = new_balancing(test_ind, config['unbalanced_ratio'], rng=rng)
 
     print(f'Number of samples in training: {len(train_ind)}')
     print(f'Number of samples in validation: {len(val_ind)}')
