@@ -390,6 +390,8 @@ class Net(pl.LightningModule):
             layers = [network['drug_dim']+network['prot_dim']] + network['layers'] + [network['output_dim']]
         layers = list(layers)
         self.model = MLP(layers, dropout=network['dropout'])
+        self.prot_proj = nn.Linear(network['prot_dim'], network['drug_dim'])
+        self.drug_proj = nn.Linear(network['drug_dim'], network['prot_dim'])
 
         self.cfg = cfg
         self.optimizer = optimizer
