@@ -91,6 +91,18 @@ def train(cfg,dataset,shared_metrics,tune=False):
         shared_metrics["test_auprc"]+= [model.test_auprc.item()]
         shared_metrics["test_f1"]+= [model.test_f1.item()]
 
+
+def rename_logger_dir(logger_dir, destination_dir):
+    destination_dir = os.path.normpath(destination_dir)
+    candidate_dir = destination_dir
+    suffix = 1
+
+    while os.path.exists(candidate_dir):
+        candidate_dir = f"{destination_dir}_{suffix}"
+        suffix += 1
+
+    os.rename(os.path.normpath(logger_dir), candidate_dir)
+
 _HYDRA_PARAMS = {
     "version_base": "1.3",
     "config_path": "configs",
@@ -238,7 +250,7 @@ def main(cfg) -> Optional[float]:
             logger.info(f'Mean test AUPRC: {np.mean(shared_metrics["test_auprc"]):.4f}')
             logger.info(f'Mean test F1: {np.mean(shared_metrics["test_f1"]):.4f}')
             new_dir = f'{new_dir}/run_{np.mean(shared_metrics["test_auc"]):.4f}/'
-            os.rename(logger_dir, new_dir)
+            rename_logger_dir(logger_dir, new_dir)
             
         else:
 
@@ -258,7 +270,7 @@ def main(cfg) -> Optional[float]:
             logger.info(f'Test AUPRC: {np.mean(test_auprc):.4f}')
             logger.info(f'Test F1: {np.mean(test_f1):.4f}')
             new_dir = f'{new_dir}/run_{np.mean(test_auc):.4f}/'
-            os.rename(logger_dir, new_dir)
+            rename_logger_dir(logger_dir, new_dir)
             
    
 if __name__ == "__main__":
