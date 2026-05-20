@@ -449,6 +449,12 @@ def parse_mean_metrics(log_text: str) -> tuple[float, float]:
     return float(auc_matches[-1]), float(auprc_matches[-1])
 
 
+def parse_metrics_for_experiment(experiment: Experiment, log_text: str) -> tuple[float, float]:
+    if experiment.dataset in {"drugbank", "bindingDB"}:
+        return parse_single_run_metrics(log_text)
+    return parse_mean_metrics(log_text)
+
+
 def ensure_serialized_features(args: argparse.Namespace, dataset: str) -> None:
     expected_files = [args.serialized_dir / name for name in SERIALIZED_FILES[dataset]]
     if all(path.exists() for path in expected_files):
@@ -528,19 +534,24 @@ def main() -> None:
 
         for run_tag, extra_overrides in run_overrides:
             log_path = args.artifacts_dir / "run_logs" / experiment.dataset / experiment.scenario_key / f"{run_tag}.log"
+            log_text = None
             if args.skip_existing and log_path.exists():
-                log_text = log_path.read_text(encoding="utf-8")
-            else:
+                cached_log_text = log_path.read_text(encoding="utf-8")
+                try:
+                    parse_metrics_for_experiment(experiment, cached_log_text)
+                except ValueError:
+                    print(f"Re-running {experiment.dataset}/{experiment.scenario_key}/{run_tag} because cached log has no final metrics.")
+                else:
+                    log_text = cached_log_text
+
+            if log_text is None:
                 overrides = base_overrides(args, experiment, run_tag)
                 overrides.extend(extra_overrides)
                 command = [sys.executable, str(RUN_PY), "--config-name", experiment.config_name, *overrides]
                 run_command(command, log_path)
                 log_text = log_path.read_text(encoding="utf-8")
 
-            if experiment.dataset in {"drugbank", "bindingDB"}:
-                auc, auprc = parse_single_run_metrics(log_text)
-            else:
-                auc, auprc = parse_mean_metrics(log_text)
+            auc, auprc = parse_metrics_for_experiment(experiment, log_text)
 
             auc_values.append(auc)
             auprc_values.append(auprc)

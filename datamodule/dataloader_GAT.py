@@ -7,20 +7,23 @@ import numpy as np
 # pytorch datalaoder
 class MyDataset(Dataset):
     def __init__(self, drug, target, DTI):
-        self.drug = drug
-        self.target = target
-        self.DTI = DTI
+        self.drug = drug.to_numpy(dtype=np.float32, copy=False)
+        self.target = target.to_numpy(dtype=np.float32, copy=False)
+        dti_values = DTI.iloc[:, :3].to_numpy()
+        self.drug_indices = dti_values[:, 0].astype(np.int64, copy=False)
+        self.target_indices = dti_values[:, 1].astype(np.int64, copy=False)
+        self.labels = dti_values[:, 2].astype(np.float32, copy=False)
         
     def __getitem__(self, index):
-        y = self.DTI.iloc[index, 2]
-        drug_index = self.DTI.iloc[index, 0]
-        target_index = self.DTI.iloc[index, 1]
-        x1 = self.drug.iloc[drug_index].values
-        x2 = self.target.iloc[target_index].values
-        return torch.tensor(x1).float(), torch.tensor(x2).float(), torch.tensor(y).float(), drug_index, target_index
+        drug_index = int(self.drug_indices[index])
+        target_index = int(self.target_indices[index])
+        x1 = torch.from_numpy(self.drug[drug_index])
+        x2 = torch.from_numpy(self.target[target_index])
+        y = torch.tensor(self.labels[index], dtype=torch.float32)
+        return x1, x2, y, drug_index, target_index
 
     def __len__(self):
-        return len(self.DTI)
+        return len(self.labels)
 
 
 class UNIDataModule(pl.LightningDataModule):
@@ -34,6 +37,16 @@ class UNIDataModule(pl.LightningDataModule):
         self.batch_size = dm_cfg['batch_size']
         self.num_workers = dm_cfg['num_workers']
         self.config = config
+
+    def _dataloader_kwargs(self):
+        kwargs = {
+            "batch_size": self.batch_size,
+            "num_workers": self.num_workers,
+            "pin_memory": True,
+        }
+        if self.num_workers > 0:
+            kwargs["persistent_workers"] = True
+        return kwargs
         
     def setup(self, stage):
         self.train_dataset = MyDataset(self.X_drug, self.X_target, self.train_ind)
@@ -42,15 +55,12 @@ class UNIDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         # REQUIRED
-        return DataLoader(self.train_dataset, batch_size=self.batch_size , shuffle=False, num_workers=self.num_workers,    # shuffle = False
-                          pin_memory=True, drop_last=True)
+        return DataLoader(self.train_dataset, shuffle=False, drop_last=True, **self._dataloader_kwargs())
 
     def val_dataloader(self):
         # OPTIONAL
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
-                          pin_memory=True, drop_last=False)
+        return DataLoader(self.val_dataset, shuffle=False, drop_last=False, **self._dataloader_kwargs())
 
     def test_dataloader(self):
         # OPTIONAL
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers,
-                          pin_memory=True, drop_last=False)
+        return DataLoader(self.test_dataset, shuffle=False, drop_last=False, **self._dataloader_kwargs())
