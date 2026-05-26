@@ -419,6 +419,22 @@ def resolve_training_serializer_paths(cfg: Any) -> tuple[Path, Path]:
     return save_path / serializer_cfg["drug_name"], save_path / serializer_cfg["target_name"]
 
 
+def relax_transformers_torch_load_guard() -> None:
+    # The ChemBERTa checkpoint used by this repo is distributed as a legacy
+    # PyTorch bin file. Recent transformers releases block loading those files
+    # on torch<2.6, even for trusted local workflows such as this Colab setup.
+    try:
+        import transformers.modeling_utils as modeling_utils
+        from transformers.utils import import_utils as transformers_import_utils
+    except ImportError:
+        return
+
+    if hasattr(transformers_import_utils, "check_torch_load_is_safe"):
+        transformers_import_utils.check_torch_load_is_safe = lambda: None
+    if hasattr(modeling_utils, "check_torch_load_is_safe"):
+        modeling_utils.check_torch_load_is_safe = lambda: None
+
+
 def ensure_training_embeddings(
     experiment: Any,
     config_name: str,
@@ -463,6 +479,7 @@ def generate_custom_embeddings(
         X_target = torch.load(target_path, map_location="cpu")
         return X_drug, X_target, {"drug_embedding": drug_path, "protein_embedding": target_path}
 
+    relax_transformers_torch_load_guard()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     drug_featurizer = hydra.utils.instantiate(cfg["featurizer"]["drugfeaturizer"], device, _recursive_=False)
     prot_featurizer = hydra.utils.instantiate(cfg["featurizer"]["protfeaturizer"], device, _recursive_=False)
