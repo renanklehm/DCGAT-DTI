@@ -9,6 +9,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import hydra
 import numpy as np
 import pandas as pd
@@ -23,7 +27,6 @@ from module.featurizer.prot_featurizer.esm_featurizer import ESMFEATURE
 from utils import utils
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 RUN_PY = REPO_ROOT / "run.py"
 
 
