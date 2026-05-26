@@ -19,6 +19,7 @@ import pandas as pd
 import pytorch_lightning as pl
 import torch
 from omegaconf import OmegaConf
+from hydra import compose, initialize_config_dir
 
 from datamodule.custom_single_table import SingleTableDTIDataModule
 from module.GAT import Net as GATNet
@@ -280,11 +281,6 @@ def featurize_unique_entities(data: pd.DataFrame, serialized_dir: Path):
     return X_drug, X_target
 
 
-def load_scenario_config(scenario: str):
-    spec = SCENARIOS[scenario[0]][scenario[1]]
-    return OmegaConf.load(spec.config_path)
-
-
 def best_param_overrides(best_params_path: Path) -> list[str]:
     if not best_params_path.exists():
         return []
@@ -365,7 +361,9 @@ def main():
     if args.dataset not in SCENARIOS or args.scenario not in SCENARIOS[args.dataset]:
         raise SystemExit(f"Unsupported dataset/scenario combination: {args.dataset}/{args.scenario}")
     spec = SCENARIOS[args.dataset][args.scenario]
-    cfg = OmegaConf.to_container(OmegaConf.load(spec.config_path), resolve=True)
+    with initialize_config_dir(version_base="1.3", config_dir=str(REPO_ROOT / "configs")):
+        cfg = compose(config_name=spec.config_name)
+    cfg = OmegaConf.to_container(cfg, resolve=True)
     cfg["datamodule"]["serializer"]["load_serialized"] = True
 
     raw = pd.read_csv(args.input_csv)
