@@ -23,8 +23,6 @@ from hydra import compose, initialize_config_dir
 
 from datamodule.custom_single_table import SingleTableDTIDataModule
 from module.GAT import Net as GATNet
-from module.featurizer.drug_featurizer.chembert_featurizer import CHEMFEATURE
-from module.featurizer.prot_featurizer.esm_featurizer import ESMFEATURE
 from utils import utils
 
 
@@ -264,10 +262,10 @@ def build_pair_table(df: pd.DataFrame):
     return data, pairs
 
 
-def featurize_unique_entities(data: pd.DataFrame, serialized_dir: Path):
+def featurize_unique_entities(cfg, data: pd.DataFrame, serialized_dir: Path):
     serialized_dir.mkdir(parents=True, exist_ok=True)
-    drug_cache = serialized_dir / "custom_drug_features.pt"
-    prot_cache = serialized_dir / "custom_protein_features.pt"
+    drug_cache = serialized_dir / cfg["datamodule"]["serializer"]["drug_name"]
+    prot_cache = serialized_dir / cfg["datamodule"]["serializer"]["target_name"]
 
     if drug_cache.exists() and prot_cache.exists():
         X_drug = torch.load(drug_cache)
@@ -275,8 +273,8 @@ def featurize_unique_entities(data: pd.DataFrame, serialized_dir: Path):
         return X_drug, X_target
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    drug_featurizer = CHEMFEATURE(device)
-    prot_featurizer = ESMFEATURE(device)
+    drug_featurizer = hydra.utils.instantiate(cfg["featurizer"]["drugfeaturizer"], device, _recursive_=False)
+    prot_featurizer = hydra.utils.instantiate(cfg["featurizer"]["protfeaturizer"], device, _recursive_=False)
 
     unique_drugs = data[["Drug_ID", "SMILES"]].drop_duplicates().sort_values("Drug_ID")
     unique_targets = data[["Prot_ID", "SEQ"]].drop_duplicates().sort_values("Prot_ID")
@@ -379,7 +377,7 @@ def main():
 
     raw = load_input_table(args.input_csv)
     data, pair_table = build_pair_table(raw)
-    X_drug, X_target = featurize_unique_entities(data, args.serialized_dir)
+    X_drug, X_target = featurize_unique_entities(cfg, data, args.serialized_dir)
 
     dataset = {
         "X_drug": X_drug,
