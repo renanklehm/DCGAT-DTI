@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any
 
 import hydra
+import numpy as np
 import pandas as pd
 import pytorch_lightning as pl
 import torch
 from omegaconf import OmegaConf
+from sklearn.metrics import average_precision_score, f1_score, roc_auc_score
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -36,6 +38,7 @@ class CustomDatasetTables:
 class FilteredCustomData:
     frame: pd.DataFrame
     excluded: pd.DataFrame
+    original: pd.DataFrame
 
 
 def parse_args() -> argparse.Namespace:
@@ -253,9 +256,8 @@ def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> Filter
         raise ValueError("All custom rows were filtered out. Check the exclusions report for details.")
 
     filtered["label"] = filtered["label"].astype(int)
-    filtered = filtered.drop(columns=["source_row"])
 
-    return FilteredCustomData(frame=filtered, excluded=excluded)
+    return FilteredCustomData(frame=filtered, excluded=excluded, original=frame.copy())
 
 
 def save_exclusions_report(excluded: pd.DataFrame, output_dir: Path) -> dict[str, Path] | None:
@@ -272,6 +274,54 @@ def save_exclusions_report(excluded: pd.DataFrame, output_dir: Path) -> dict[str
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return {"rows": exclusions_path, "summary": summary_path}
+
+
+def save_prediction_export(
+    filtered_custom_data: FilteredCustomData,
+    prediction_rows: pd.DataFrame,
+    output_dir: Path,
+    input_path: Path,
+    delimiter: str,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    export_frame = filtered_custom_data.original.copy()
+    export_frame = export_frame.rename(columns={"SMILES": "smiles", "SEQ": "sequence", "label": "activity"})
+    export_frame["excluded_reason"] = ""
+    export_frame["predicted_label"] = pd.Series([pd.NA] * len(export_frame), dtype="Int64")
+    export_frame["probability_active"] = np.nan
+    export_frame["probability_inactive"] = np.nan
+
+    if not filtered_custom_data.excluded.empty:
+        exclusion_reasons = filtered_custom_data.excluded.set_index("source_row")["reason"]
+        export_frame.loc[export_frame["source_row"].isin(exclusion_reasons.index), "excluded_reason"] = (
+            export_frame.loc[export_frame["source_row"].isin(exclusion_reasons.index), "source_row"].map(exclusion_reasons)
+        )
+
+    prediction_indexed = prediction_rows.set_index("source_row")
+    prediction_mask = export_frame["source_row"].isin(prediction_indexed.index)
+    export_frame.loc[prediction_mask, "predicted_label"] = (
+        export_frame.loc[prediction_mask, "source_row"].map(prediction_indexed["predicted_label"])
+    )
+    export_frame.loc[prediction_mask, "probability_active"] = (
+        export_frame.loc[prediction_mask, "source_row"].map(prediction_indexed["probability_active"])
+    )
+    export_frame.loc[prediction_mask, "probability_inactive"] = (
+        export_frame.loc[prediction_mask, "source_row"].map(prediction_indexed["probability_inactive"])
+    )
+
+    export_frame = export_frame.drop(columns=["source_row"])
+
+    csv_path = output_dir / "predictions_with_scores.csv"
+    export_frame.to_csv(csv_path, sep=delimiter, index=False)
+
+    outputs = {"csv": csv_path}
+    if input_path.suffix.lower() == ".json":
+        json_path = output_dir / "predictions_with_scores.json"
+        json_path.write_text(export_frame.to_json(orient="records", indent=2), encoding="utf-8")
+        outputs["json"] = json_path
+
+    return outputs
 
 
 def build_custom_tables(frame: pd.DataFrame) -> CustomDatasetTables:
@@ -520,6 +570,34 @@ def build_custom_eval_dataset(
     }
 
 
+def build_prediction_dataset(
+    tables: CustomDatasetTables,
+    X_drug_embeddings: pd.DataFrame,
+    X_target_embeddings: pd.DataFrame,
+    relation_table: pd.DataFrame,
+) -> dict[str, pd.DataFrame]:
+    drug_index = pd.Series(range(len(X_drug_embeddings)), index=X_drug_embeddings.index)
+    target_index = pd.Series(range(len(X_target_embeddings)), index=X_target_embeddings.index)
+
+    test_table = relation_table.copy()
+    test_table["Drug_ID"] = test_table["Drug_ID"].map(drug_index)
+    test_table["Prot_ID"] = test_table["Prot_ID"].map(target_index)
+    if test_table[["Drug_ID", "Prot_ID"]].isna().any().any():
+        raise ValueError("Could not map one or more custom drug/protein identifiers to embedding indices.")
+    test_table["Drug_ID"] = test_table["Drug_ID"].astype(int)
+    test_table["Prot_ID"] = test_table["Prot_ID"].astype(int)
+
+    empty = test_table.iloc[0:0].copy()
+    return {
+        "X_drug": X_drug_embeddings,
+        "X_target": X_target_embeddings,
+        "train": empty,
+        "val": empty,
+        "test": test_table,
+        "ddi": None,
+    }
+
+
 def export_checkpoint_to_safetensors(checkpoint_path: Path, output_path: Path, metadata: dict[str, str]) -> None:
     try:
         from safetensors.torch import save_file
@@ -533,14 +611,15 @@ def export_checkpoint_to_safetensors(checkpoint_path: Path, output_path: Path, m
     save_file(cpu_state_dict, str(output_path), metadata=metadata)
 
 
-def evaluate_checkpoint_on_custom_dataset(
+def predict_checkpoint_on_custom_dataset(
     cfg_dict: dict[str, Any],
     checkpoint_path: Path,
     dataset: dict[str, pd.DataFrame],
-) -> dict[str, float]:
+    source_rows: list[int],
+) -> pd.DataFrame:
+    from datamodule.dataloader_GAT import MyDataset
     from module.cognn_cross import Net
 
-    datamodule = hydra.utils.instantiate(cfg_dict["datamodule"], cfg_dict, dataset, _recursive_=False)
     model = Net.load_from_checkpoint(
         str(checkpoint_path),
         cfg=cfg_dict,
@@ -551,20 +630,68 @@ def evaluate_checkpoint_on_custom_dataset(
         GAT_params=cfg_dict["module"]["GAT_params"],
     )
 
-    accelerator = "gpu" if torch.cuda.is_available() else "cpu"
-    trainer = pl.Trainer(accelerator=accelerator, devices=1, logger=False, enable_checkpointing=False)
-    trainer.test(model, datamodule=datamodule)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.eval()
 
-    def scalar(value: Any) -> float:
-        if isinstance(value, torch.Tensor):
-            return float(value.detach().cpu().item())
-        return float(value)
+    test_table = dataset["test"].reset_index(drop=True)
+    prediction_dataset = MyDataset(dataset["X_drug"], dataset["X_target"], test_table)
+    dataloader = torch.utils.data.DataLoader(
+        prediction_dataset,
+        batch_size=cfg_dict["datamodule"]["dm_cfg"]["batch_size"],
+        shuffle=False,
+        num_workers=0,
+    )
 
-    return {
-        "test_auc": scalar(model.test_auc),
-        "test_auprc": scalar(model.test_auprc),
-        "test_f1": scalar(model.test_f1),
-    }
+    probabilities: list[float] = []
+    true_labels: list[int] = []
+
+    with torch.no_grad():
+        for batch in dataloader:
+            x1, x2, y, drugs, targets = batch
+            x1 = x1.to(device)
+            x2 = x2.to(device)
+            y = y.to(device)
+            drugs = drugs.to(device)
+            targets = targets.to(device)
+            x1_org, x2_org = x1, x2
+            x1_proc, x2_proc, x1_network, x2_network, inv_drug, inv_target = model.common_preprocess(
+                x1, x2, drugs, targets, 0
+            )
+            x1_proc = x1_proc.to(device)
+            x2_proc = x2_proc.to(device)
+            x1_network = x1_network.to(device)
+            x2_network = x2_network.to(device)
+            inv_drug = inv_drug.to(device)
+            inv_target = inv_target.to(device)
+
+            logits, _, _ = model.forward(
+                x1_proc,
+                x2_proc,
+                x1_org,
+                x2_org,
+                x1_network,
+                x2_network,
+                inv_drug,
+                inv_target,
+                y,
+            )
+            batch_probabilities = torch.sigmoid(logits).detach().cpu().numpy().tolist()
+            probabilities.extend(batch_probabilities)
+            true_labels.extend(y.detach().cpu().numpy().astype(int).tolist())
+
+    predicted_labels = [1 if probability >= 0.5 else 0 for probability in probabilities]
+    probability_inactive = [1.0 - probability for probability in probabilities]
+
+    return pd.DataFrame(
+        {
+            "source_row": source_rows,
+            "true_label": true_labels,
+            "predicted_label": predicted_labels,
+            "probability_active": probabilities,
+            "probability_inactive": probability_inactive,
+        }
+    )
 
 
 def ensure_repo_on_path() -> None:
@@ -621,8 +748,38 @@ def main() -> None:
         args.reuse_custom_embeddings,
     )
 
-    dataset = build_custom_eval_dataset(tables, X_drug_embeddings, X_target_embeddings)
-    metrics = evaluate_checkpoint_on_custom_dataset(eval_cfg_dict, checkpoint_path, dataset)
+    relations_with_source = filtered_custom_data.frame[["source_row"]].copy()
+    relations_with_source["Drug_ID"] = tables.DTI["Drug_ID"].values
+    relations_with_source["Prot_ID"] = tables.DTI["Prot_ID"].values
+    relations_with_source["label"] = tables.DTI["label"].values
+    prediction_dataset = build_prediction_dataset(
+        tables,
+        X_drug_embeddings,
+        X_target_embeddings,
+        relations_with_source[["Drug_ID", "Prot_ID", "label"]],
+    )
+    prediction_rows = predict_checkpoint_on_custom_dataset(
+        eval_cfg_dict,
+        checkpoint_path,
+        prediction_dataset,
+        relations_with_source["source_row"].tolist(),
+    )
+    prediction_exports = save_prediction_export(
+        filtered_custom_data,
+        prediction_rows,
+        export_dir,
+        args.custom_data,
+        args.delimiter,
+    )
+
+    y_true = prediction_rows["true_label"].to_numpy()
+    y_score = prediction_rows["probability_active"].to_numpy()
+    y_pred = prediction_rows["predicted_label"].to_numpy()
+    metrics = {
+        "test_auc": float(roc_auc_score(y_true, y_score)),
+        "test_auprc": float(average_precision_score(y_true, y_score)),
+        "test_f1": float(f1_score(y_true, y_pred)),
+    }
 
     safetensors_path = export_dir / f"{checkpoint_path.stem}.safetensors"
     export_checkpoint_to_safetensors(
@@ -649,6 +806,7 @@ def main() -> None:
         "prepared_tables": {key: str(path.resolve()) for key, path in prepared_paths.items()},
         "exclusions": None if exclusions_report is None else {key: str(path.resolve()) for key, path in exclusions_report.items()},
         "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
+        "prediction_exports": {key: str(path.resolve()) for key, path in prediction_exports.items()},
         "checkpoint": str(checkpoint_path.resolve()),
         "safetensors": str(safetensors_path.resolve()),
         "metrics": metrics,
@@ -663,6 +821,9 @@ def main() -> None:
     if exclusions_report is not None:
         print(f"Excluded rows report: {exclusions_report['rows']}")
         print(f"Excluded rows summary: {exclusions_report['summary']}")
+    print(f"Predictions export: {prediction_exports['csv']}")
+    if "json" in prediction_exports:
+        print(f"Predictions export JSON: {prediction_exports['json']}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Safetensors: {safetensors_path}")
     print(f"Custom test AUC: {metrics['test_auc']:.6f}")
