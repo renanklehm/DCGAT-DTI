@@ -2,12 +2,9 @@ from __future__ import annotations
 
 import argparse
 import os
-import shlex
-import subprocess
 import sys
-import re
-from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
@@ -22,194 +19,11 @@ from omegaconf import OmegaConf
 from hydra import compose, initialize_config_dir
 
 from datamodule.custom_single_table import SingleTableDTIDataModule
-from module.GAT import Net as GATNet
+from reproduce_paper import ALL_EXPERIMENTS, base_overrides, ensure_serialized_features, normalize_dir, run_command
 from utils import utils
 
 
 RUN_PY = REPO_ROOT / "run.py"
-
-
-@dataclass(frozen=True)
-class ScenarioSpec:
-    config_name: str
-    best_param_name: str
-    config_path: Path
-    dataset_name: str
-    module_kind: str
-    paper_label: str
-    overrides: tuple[str, ...] = ()
-
-
-SCENARIOS = {
-    "drugbank": {
-        "balanced_warm": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "random_balanced_GAT.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=random", "multiprocessing.multiprocessing=False"),
-        ),
-        "balanced_cold_drug": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "cold_drug_balanced_GAT.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=cold_drug", "multiprocessing.multiprocessing=False"),
-        ),
-        "balanced_cold_target": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "cold_target_balanced.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=cold_target", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_warm": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "random_unbalanced.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=random", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_cold_drug": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "cold_drug_unbalanced.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=cold_drug", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_cold_target": ScenarioSpec(
-        "drugbank_train_GAT.yaml",
-        "cold_target_unbalanced.yaml",
-        REPO_ROOT / "configs" / "drugbank_train_GAT.yaml",
-        "drugbank",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=cold_target", "multiprocessing.multiprocessing=False"),
-        ),
-    },
-    "bindingDB": {
-        "balanced_warm": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "random_balanced_GAT.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=random", "multiprocessing.multiprocessing=False"),
-        ),
-        "balanced_cold_drug": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "cold_drug_balanced_GAT.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=cold_drug", "multiprocessing.multiprocessing=False"),
-        ),
-        "balanced_cold_target": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "cold_target_balanced.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=True", "datamodule.splitting.splitting_strategy=cold_target", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_warm": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "random_unbalanced.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=random", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_cold_drug": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "cold_drug_unbalanced.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=cold_drug", "multiprocessing.multiprocessing=False"),
-        ),
-        "unbalanced_cold_target": ScenarioSpec(
-        "bindingDB_train_GAT.yaml",
-        "cold_target_unbalanced.yaml",
-        REPO_ROOT / "configs" / "bindingDB_train_GAT.yaml",
-        "bindingDB",
-        "GAT",
-        ("datamodule.splitting.balanced=False", "datamodule.splitting.splitting_strategy=cold_target", "multiprocessing.multiprocessing=False"),
-        ),
-    },
-    "yamanishi": {
-        "warm_start_1_1": ScenarioSpec(
-        "yamanishi_train.yaml",
-        "yamanishi_GAT.yaml",
-        REPO_ROOT / "configs" / "yamanishi_train.yaml",
-        "yamanishi",
-        "GAT",
-        ("preprocess.data_path=data_folds/warm_start_1_1/",),
-        ),
-        "warm_start_1_10": ScenarioSpec(
-        "yamanishi_train.yaml",
-        "yamanishi.yaml",
-        REPO_ROOT / "configs" / "yamanishi_train.yaml",
-        "yamanishi",
-        "GAT",
-        ("preprocess.data_path=data_folds/warm_start_1_10/",),
-        ),
-        "drug_coldstart": ScenarioSpec(
-        "yamanishi_train.yaml",
-        "yamanishi_colddrug.yaml",
-        REPO_ROOT / "configs" / "yamanishi_train.yaml",
-        "yamanishi",
-        "GAT",
-        ("preprocess.data_path=data_folds/drug_coldstart/",),
-        ),
-        "protein_coldstart": ScenarioSpec(
-        "yamanishi_train.yaml",
-        "yamanishi.yaml",
-        REPO_ROOT / "configs" / "yamanishi_train.yaml",
-        "yamanishi",
-        "GAT",
-        ("preprocess.data_path=data_folds/protein_coldstart/",),
-        ),
-    },
-    "luo": {
-        "warm_start_1_1": ScenarioSpec(
-        "luo_train.yaml",
-        "luo_GAT.yaml",
-        REPO_ROOT / "configs" / "luo_train.yaml",
-        "luo",
-        "GAT",
-        ("preprocess.data_path=data_folds/warm_start_1_1/",),
-        ),
-        "warm_start_1_10": ScenarioSpec(
-        "luo_train.yaml",
-        "luo.yaml",
-        REPO_ROOT / "configs" / "luo_train.yaml",
-        "luo",
-        "GAT",
-        ("preprocess.data_path=data_folds/warm_start_1_10/",),
-        ),
-        "drug_coldstart": ScenarioSpec(
-        "luo_train.yaml",
-        "luo.yaml",
-        REPO_ROOT / "configs" / "luo_train.yaml",
-        "luo",
-        "GAT",
-        ("preprocess.data_path=data_folds/drug_coldstart/",),
-        ),
-        "protein_coldstart": ScenarioSpec(
-        "luo_train.yaml",
-        "luo_protcoldstart.yaml",
-        REPO_ROOT / "configs" / "luo_train.yaml",
-        "luo",
-        "GAT",
-        ("preprocess.data_path=data_folds/protein_coldstart/",),
-        ),
-    },
-}
 
 
 def parse_args():
@@ -218,8 +32,12 @@ def parse_args():
     parser.add_argument("--scenario", required=True, help="Paper scenario key from reproduce_paper.py.")
     parser.add_argument("--input-csv", required=True, type=Path, help="CSV or JSON with Canonical Smiles, Sequence, Activity Value Log, Activity Classification.")
     parser.add_argument("--artifacts-dir", required=True, type=Path, help="Directory for checkpoints and logs.")
-    parser.add_argument("--serialized-dir", type=Path, default=REPO_ROOT / "datasets" / "custom_serialized", help="Directory for cached features.")
-    parser.add_argument("--checkpoint-name", default="best.ckpt", help="Checkpoint filename to use for the trained model.")
+    parser.add_argument("--benchmark-serialized-dir", type=Path, default=REPO_ROOT / "datasets" / "serialized", help="Directory containing serialized benchmark features used for scenario training.")
+    parser.add_argument("--custom-serialized-dir", type=Path, default=REPO_ROOT / "datasets" / "custom_serialized", help="Directory for cached features of the unseen evaluation dataset.")
+    parser.add_argument("--drugbank-root", type=Path, default=REPO_ROOT / "datasets" / "drugbank", help="DrugBank dataset directory used by preprocess.drugbank.data_path.")
+    parser.add_argument("--bindingdb-root", type=Path, default=REPO_ROOT / "datasets" / "bindingDB", help="BindingDB dataset directory used by preprocess.bindingDB.data_path.")
+    parser.add_argument("--yamanishi-root", type=Path, default=REPO_ROOT / "datasets" / "yamanishi_08", help="Root directory containing the Yamanishi fold and feature files.")
+    parser.add_argument("--luo-root", type=Path, default=REPO_ROOT / "datasets" / "luo's_dataset", help="Root directory containing the Luo fold, feature, and mapping files.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use-gpu", action="store_true", help="Use GPU if available.")
     return parser.parse_args()
@@ -246,6 +64,16 @@ def normalize_activity(value: str) -> int:
 
 
 def build_pair_table(df: pd.DataFrame):
+    required_columns = {
+        "Canonical Smiles",
+        "Sequence",
+        "Activity Value Log",
+        "Activity Classification",
+    }
+    missing_columns = sorted(required_columns.difference(df.columns))
+    if missing_columns:
+        raise ValueError(f"Missing required columns: {missing_columns}")
+
     data = df.copy()
     data = data.rename(columns={
         "Canonical Smiles": "SMILES",
@@ -290,94 +118,105 @@ def featurize_unique_entities(cfg, data: pd.DataFrame, serialized_dir: Path):
     return X_drug, X_target
 
 
-def best_param_overrides(best_params_path: Path) -> list[str]:
-    if not best_params_path.exists():
-        return []
-
-    best_cfg = OmegaConf.to_container(OmegaConf.load(best_params_path), resolve=True)
-    overrides = []
-    for expr, value in best_cfg.items():
-        matches = re.findall(r"\['([^']+)'\]", expr)
-        if not matches:
-            continue
-        overrides.append(f"{'.'.join(matches)}={value!r}" if isinstance(value, str) else f"{'.'.join(matches)}={value}")
-    return overrides
+def find_experiment(dataset: str, scenario: str):
+    for experiment in ALL_EXPERIMENTS:
+        if experiment.dataset == dataset and experiment.scenario_key == scenario:
+            return experiment
+    raise SystemExit(f"Unsupported dataset/scenario combination: {dataset}/{scenario}")
 
 
-def build_model(cfg, dataset):
-    module_target = cfg["module"]["_target_"]
-    if module_target == "module.GAT.Net":
-        return GATNet(cfg, dataset, cfg["module"]["network"], cfg["module"]["optimizer"], cfg["module"]["criterion"], cfg["module"]["GAT_params"])
-    raise ValueError(f"Unsupported model architecture: {module_target}")
+def set_override(overrides: list[str], key: str, value: str) -> None:
+    prefix = f"{key}="
+    for index, override in enumerate(overrides):
+        if override.startswith(prefix):
+            overrides[index] = f"{prefix}{value}"
+            return
+    overrides.append(f"{prefix}{value}")
 
 
-def scenario_overrides(args, spec: ScenarioSpec):
-    artifacts_root = args.artifacts_dir / spec.dataset_name / spec.module_kind / args.dataset / args.scenario
+def make_reproduction_args(args) -> SimpleNamespace:
+    return SimpleNamespace(
+        artifacts_dir=args.artifacts_dir,
+        serialized_dir=args.benchmark_serialized_dir,
+        yamanishi_root=args.yamanishi_root,
+        luo_root=args.luo_root,
+        bindingdb_root=args.bindingdb_root,
+        drugbank_root=args.drugbank_root,
+    )
+
+
+def scenario_overrides(args, experiment):
+    run_tag = f"custom_eval_seed_{args.seed}"
+    artifacts_root = args.artifacts_dir / experiment.dataset / experiment.scenario_key / run_tag
     checkpoint_dir = artifacts_root / "checkpoints"
-    hydra_run_dir = artifacts_root / "hydra"
-    tb_dir = artifacts_root / "tensorboard"
+    tensorboard_dir = artifacts_root / "tensorboard"
 
-    overrides = [
-        f"callbacks.model_checkpoint.dirpath={checkpoint_dir.as_posix()}/",
-        "callbacks.model_checkpoint.save_top_k=1",
-        "callbacks.model_checkpoint.save_last=True",
-        f"hydra.run.dir={hydra_run_dir.as_posix()}/",
-        "hydra.output_subdir=null",
-        "hydra.job.chdir=False",
-        f"logger.name={spec.dataset_name}",
-    ]
-    overrides.extend(spec.overrides)
-    if spec.dataset_name == "drugbank":
-        overrides.append(f"preprocess.data_path={(REPO_ROOT / 'datasets' / 'drugbank').as_posix()}/")
-    elif spec.dataset_name == "bindingDB":
-        overrides.append(f"preprocess.data_path={(REPO_ROOT / 'datasets' / 'bindingDB').as_posix()}/")
-    elif spec.dataset_name == "yamanishi":
-        overrides.append(f"preprocess.root_path={(REPO_ROOT / 'datasets' / 'yamanishi_08').as_posix()}/")
-    elif spec.dataset_name == "luo":
-        luo_root = REPO_ROOT / "datasets" / "luo's_dataset"
-        overrides.append(f"preprocess.root_path={luo_root.as_posix()}/")
-    overrides.extend(best_param_overrides(REPO_ROOT / "configs" / "best_params" / spec.best_param_name))
-    overrides.append(f"datamodule.serializer.save_path={(args.serialized_dir).as_posix()}/")
-    overrides.append("datamodule.serializer.load_serialized=True")
-    return overrides, artifacts_root, checkpoint_dir, tb_dir
+    overrides = base_overrides(make_reproduction_args(args), experiment, run_tag)
+    set_override(overrides, "callbacks.model_checkpoint.dirpath", normalize_dir(checkpoint_dir))
+    set_override(overrides, "callbacks.model_checkpoint.save_top_k", "1")
+    set_override(overrides, "callbacks.model_checkpoint.save_last", "True")
+
+    if experiment.dataset in {"drugbank", "bindingDB"}:
+        set_override(overrides, "datamodule.splitting.seed", str(args.seed))
+
+    return overrides, artifacts_root, checkpoint_dir, tensorboard_dir
 
 
-def run_training_scenario(args, spec: ScenarioSpec):
-    overrides, artifacts_root, checkpoint_dir, tb_dir = scenario_overrides(args, spec)
-    tb_dir.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable,
-        str(RUN_PY),
-        "--config-name",
-        spec.config_name,
-        *overrides,
-    ]
-    env = dict(os.environ)
-    env.setdefault("TENSORBOARD_LOG_DIR", str(tb_dir))
-    result = subprocess.run(command, cwd=REPO_ROOT, env=env, check=False, text=True, capture_output=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"Training command failed: {shlex.join(command)}\n{result.stdout}\n{result.stderr}")
+def load_scenario_config(experiment, overrides: list[str]):
+    with initialize_config_dir(version_base="1.3", config_dir=str(REPO_ROOT / "configs")):
+        cfg = compose(config_name=experiment.config_name, overrides=overrides)
+
+    cfg = OmegaConf.to_container(cfg, resolve=True)
+    cfg["best_param_name"] = experiment.best_param_name
+    return utils.update_best_param(cfg)
+
+
+def load_trained_model(cfg, dataset, checkpoint_path: Path):
+    model_class = hydra.utils.get_class(cfg["module"]["_target_"])
+    checkpoint_kwargs = {
+        "cfg": cfg,
+        "dataset": dataset,
+        "network": cfg["module"]["network"],
+        "optimizer": cfg["module"]["optimizer"],
+        "criterion": cfg["module"]["criterion"],
+    }
+    if "GAT_params" in cfg["module"]:
+        checkpoint_kwargs["GAT_params"] = cfg["module"]["GAT_params"]
+    return model_class.load_from_checkpoint(str(checkpoint_path), **checkpoint_kwargs)
+
+
+def run_training_scenario(args, experiment):
+    overrides, artifacts_root, checkpoint_dir, tensorboard_dir = scenario_overrides(args, experiment)
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TENSORBOARD_LOG_DIR", str(tensorboard_dir))
+
+    log_path = artifacts_root / "training.log"
+    command = [sys.executable, str(RUN_PY), "--config-name", experiment.config_name, *overrides]
+    run_command(command, log_path)
+
     checkpoints = sorted(checkpoint_dir.glob("*.ckpt"), key=lambda path: path.stat().st_mtime, reverse=True)
     if not checkpoints:
         raise RuntimeError(f"No checkpoint found in {checkpoint_dir}")
-    return checkpoints[0], artifacts_root
+    return checkpoints[0], artifacts_root, overrides
 
 
 def main():
     args = parse_args()
     pl.seed_everything(args.seed, workers=True)
 
-    if args.dataset not in SCENARIOS or args.scenario not in SCENARIOS[args.dataset]:
-        raise SystemExit(f"Unsupported dataset/scenario combination: {args.dataset}/{args.scenario}")
-    spec = SCENARIOS[args.dataset][args.scenario]
-    with initialize_config_dir(version_base="1.3", config_dir=str(REPO_ROOT / "configs")):
-        cfg = compose(config_name=spec.config_name)
-    cfg = OmegaConf.to_container(cfg, resolve=True)
-    cfg["datamodule"]["serializer"]["load_serialized"] = True
+    experiment = find_experiment(args.dataset, args.scenario)
+
+    args.artifacts_dir.mkdir(parents=True, exist_ok=True)
+    args.benchmark_serialized_dir.mkdir(parents=True, exist_ok=True)
+    args.custom_serialized_dir.mkdir(parents=True, exist_ok=True)
+
+    ensure_serialized_features(make_reproduction_args(args), args.dataset)
+    best_path, artifacts_root, overrides = run_training_scenario(args, experiment)
+    cfg = load_scenario_config(experiment, overrides)
 
     raw = load_input_table(args.input_csv)
     data, pair_table = build_pair_table(raw)
-    X_drug, X_target = featurize_unique_entities(cfg, data, args.serialized_dir)
+    X_drug, X_target = featurize_unique_entities(cfg, data, args.custom_serialized_dir)
 
     dataset = {
         "X_drug": X_drug,
@@ -386,17 +225,7 @@ def main():
     }
 
     datamodule = SingleTableDTIDataModule(cfg, dataset, cfg["datamodule"]["dm_cfg"], cfg["datamodule"]["splitting"], cfg["datamodule"]["serializer"])
-    best_path, artifacts_root = run_training_scenario(args, spec)
-    model = build_model(cfg, dataset)
-    trained_model = type(model).load_from_checkpoint(
-        str(best_path),
-        cfg=cfg,
-        dataset=dataset,
-        network=cfg["module"]["network"],
-        optimizer=cfg["module"]["optimizer"],
-        criterion=cfg["module"]["criterion"],
-        **({"GAT_params": cfg["module"]["GAT_params"]} if "GAT_params" in cfg["module"] else {}),
-    )
+    trained_model = load_trained_model(cfg, dataset, best_path)
 
     trainer = pl.Trainer(accelerator="gpu" if args.use_gpu and torch.cuda.is_available() else "cpu", devices=1, logger=False)
     test_results = trainer.test(trained_model, datamodule=datamodule, ckpt_path=None)

@@ -1,16 +1,54 @@
-from transformers import AutoModelForMaskedLM, AutoTokenizer
-import torch
-import numpy as np
-from tqdm import tqdm
+import importlib.util
 import sys
+import types
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
+
+def _patch_incompatible_torchao() -> None:
+    """Shadow torchao when it is installed against an incompatible torch build.
+
+    Recent transformers releases import `torchao` from `modeling_utils`. On some
+    environments `torchao` is present, but the matching torch build does not ship
+    `torch.sparse._triton_ops_meta`, which makes any model import fail before the
+    featurizer can load ChemBERT.
+    """
+
+    if "torchao" in sys.modules:
+        return
+
+    if importlib.util.find_spec("torchao") is None:
+        return
+
+    if importlib.util.find_spec("torch.sparse._triton_ops_meta") is not None:
+        return
+
+    quantization_module = types.ModuleType("torchao.quantization")
+
+    class Int4WeightOnlyConfig:  # pragma: no cover - compatibility shim
+        pass
+
+    quantization_module.Int4WeightOnlyConfig = Int4WeightOnlyConfig
+
+    torchao_module = types.ModuleType("torchao")
+    torchao_module.quantization = quantization_module
+
+    sys.modules["torchao"] = torchao_module
+    sys.modules["torchao.quantization"] = quantization_module
 
 class CHEMFEATURE:
     def __init__(self,device):
+        _patch_incompatible_torchao()
+        from transformers import AutoModelForMaskedLM, AutoTokenizer
+
         self.model = AutoModelForMaskedLM.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
         #total parameters in the model
         #print(sum(p.numel() for p in self.model.parameters()))
         #sys.exit()
         self.model = self.model.to(device)
+        self.model.eval()
         self.tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
         self.device = device
 
