@@ -32,6 +32,12 @@ class CustomDatasetTables:
     DTI: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class FilteredCustomData:
+    frame: pd.DataFrame
+    excluded: pd.DataFrame
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -152,7 +158,7 @@ def get_experiment(module: Any, scenario: str) -> Any:
     raise ValueError(f"Unknown scenario '{scenario}'. Available scenarios: {', '.join(available)}")
 
 
-def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> pd.DataFrame:
+def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> FilteredCustomData:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         frame = pd.read_csv(path, sep=delimiter, header=0 if has_header else None)
@@ -204,28 +210,68 @@ def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> pd.Dat
     frame["SMILES"] = frame["SMILES"].astype(str).str.strip()
     frame["SEQ"] = frame["SEQ"].astype(str).str.strip()
     frame["label"] = frame["label"].astype(str).str.strip()
+    frame = frame.reset_index(drop=True)
+    frame.insert(0, "source_row", frame.index.astype(int))
+
     invalid_labels = ~frame["label"].isin({"0", "1"})
-    if invalid_labels.any():
-        count = int(invalid_labels.sum())
-        raise ValueError(f"Found {count} activation values outside {{0, 1}}.")
-    frame["label"] = frame["label"].astype(int)
-
     invalid_sequences = ~frame["SEQ"].str.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+")
-    if invalid_sequences.any():
-        count = int(invalid_sequences.sum())
-        raise ValueError(f"Found {count} protein sequences with non-canonical amino-acid characters.")
-
     too_long_smiles = frame["SMILES"].str.len() > 510
-    if too_long_smiles.any():
-        count = int(too_long_smiles.sum())
-        raise ValueError(f"Found {count} SMILES strings longer than the repo preprocess limit of 510.")
-
     too_long_sequences = frame["SEQ"].str.len() > 700
-    if too_long_sequences.any():
-        count = int(too_long_sequences.sum())
-        raise ValueError(f"Found {count} protein sequences longer than the repo preprocess limit of 700.")
+    empty_smiles = frame["SMILES"].eq("")
+    empty_sequences = frame["SEQ"].eq("")
 
-    return frame
+    exclusion_reason = pd.Series("", index=frame.index, dtype="object")
+    exclusion_reason = exclusion_reason.mask(empty_smiles, exclusion_reason.where(~empty_smiles, "empty_smiles"))
+    exclusion_reason = exclusion_reason.mask(
+        empty_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(empty_sequences & exclusion_reason.eq("")), "empty_sequence"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        invalid_labels & exclusion_reason.eq(""),
+        exclusion_reason.where(~(invalid_labels & exclusion_reason.eq("")), "invalid_activation"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        invalid_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(invalid_sequences & exclusion_reason.eq("")), "non_canonical_sequence"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        too_long_smiles & exclusion_reason.eq(""),
+        exclusion_reason.where(~(too_long_smiles & exclusion_reason.eq("")), "smiles_too_long"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        too_long_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(too_long_sequences & exclusion_reason.eq("")), "sequence_too_long"),
+    )
+
+    excluded_mask = exclusion_reason.ne("")
+    excluded = frame.loc[excluded_mask].copy()
+    if not excluded.empty:
+        excluded.insert(1, "reason", exclusion_reason.loc[excluded_mask].values)
+
+    filtered = frame.loc[~excluded_mask].copy()
+    if filtered.empty:
+        raise ValueError("All custom rows were filtered out. Check the exclusions report for details.")
+
+    filtered["label"] = filtered["label"].astype(int)
+    filtered = filtered.drop(columns=["source_row"])
+
+    return FilteredCustomData(frame=filtered, excluded=excluded)
+
+
+def save_exclusions_report(excluded: pd.DataFrame, output_dir: Path) -> dict[str, Path] | None:
+    if excluded.empty:
+        return None
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    exclusions_path = output_dir / "excluded_rows.tsv"
+    summary_path = output_dir / "excluded_summary.json"
+    excluded.to_csv(exclusions_path, sep="\t", index=False)
+    summary = {
+        "excluded_rows": int(len(excluded)),
+        "reasons": excluded["reason"].value_counts().sort_index().to_dict(),
+    }
+    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {"rows": exclusions_path, "summary": summary_path}
 
 
 def build_custom_tables(frame: pd.DataFrame) -> CustomDatasetTables:
@@ -529,8 +575,9 @@ def main() -> None:
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     args.serialized_dir.mkdir(parents=True, exist_ok=True)
 
-    custom_frame = read_custom_triplets(args.custom_data, args.delimiter, args.has_header)
-    tables = build_custom_tables(custom_frame)
+    filtered_custom_data = read_custom_triplets(args.custom_data, args.delimiter, args.has_header)
+    exclusions_report = save_exclusions_report(filtered_custom_data.excluded, prepared_dir)
+    tables = build_custom_tables(filtered_custom_data.frame)
     prepared_paths = save_custom_tables(tables, prepared_dir)
 
     run_tag = "single_run"
@@ -579,9 +626,11 @@ def main() -> None:
         "best_param_name": experiment.best_param_name,
         "custom_data": str(args.custom_data.resolve()),
         "samples": sample_count,
+        "excluded_rows": int(len(filtered_custom_data.excluded)),
         "positives": positive_count,
         "negatives": sample_count - positive_count,
         "prepared_tables": {key: str(path.resolve()) for key, path in prepared_paths.items()},
+        "exclusions": None if exclusions_report is None else {key: str(path.resolve()) for key, path in exclusions_report.items()},
         "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
         "checkpoint": str(checkpoint_path.resolve()),
         "safetensors": str(safetensors_path.resolve()),
@@ -594,6 +643,9 @@ def main() -> None:
     print(f"Prepared drug table: {prepared_paths['drug_table']}")
     print(f"Prepared protein table: {prepared_paths['protein_table']}")
     print(f"Prepared relation table: {prepared_paths['relation_table']}")
+    if exclusions_report is not None:
+        print(f"Excluded rows report: {exclusions_report['rows']}")
+        print(f"Excluded rows summary: {exclusions_report['summary']}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Safetensors: {safetensors_path}")
     print(f"Custom test AUC: {metrics['test_auc']:.6f}")
