@@ -20,6 +20,7 @@ from hydra import compose, initialize_config_dir
 
 from datamodule.custom_single_table import SingleTableDTIDataModule
 from reproduce_paper import ALL_EXPERIMENTS, base_overrides, ensure_serialized_features, normalize_dir, run_command
+from utils.feature_serialization import materialize_serialized_features
 from utils import utils
 
 
@@ -40,6 +41,7 @@ def parse_args():
     parser.add_argument("--luo-root", type=Path, default=REPO_ROOT / "datasets" / "luo's_dataset", help="Root directory containing the Luo fold, feature, and mapping files.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use-gpu", action="store_true", help="Use GPU if available.")
+    parser.add_argument("--serialize-only", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -90,32 +92,40 @@ def build_pair_table(df: pd.DataFrame):
     return data, pairs
 
 
-def featurize_unique_entities(cfg, data: pd.DataFrame, serialized_dir: Path):
-    serialized_dir.mkdir(parents=True, exist_ok=True)
+def custom_entity_tables(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    X_drug = data[["Drug_ID", "SMILES"]].drop_duplicates().sort_values("Drug_ID").set_index("Drug_ID")
+    X_target = data[["Prot_ID", "SEQ"]].drop_duplicates().sort_values("Prot_ID").set_index("Prot_ID")
+    return X_drug, X_target
+
+
+def load_serialized_entities(cfg, serialized_dir: Path):
     drug_cache = serialized_dir / cfg["datamodule"]["serializer"]["drug_name"]
     prot_cache = serialized_dir / cfg["datamodule"]["serializer"]["target_name"]
+    return torch.load(drug_cache), torch.load(prot_cache)
 
+
+def ensure_custom_serialized_features(args, experiment, overrides) -> None:
+    cfg = load_scenario_config(experiment, overrides)
+    drug_cache = args.custom_serialized_dir / cfg["datamodule"]["serializer"]["drug_name"]
+    prot_cache = args.custom_serialized_dir / cfg["datamodule"]["serializer"]["target_name"]
     if drug_cache.exists() and prot_cache.exists():
-        X_drug = torch.load(drug_cache)
-        X_target = torch.load(prot_cache)
-        return X_drug, X_target
+        return
+    serialize_custom_features(args, experiment, overrides)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    drug_featurizer = hydra.utils.instantiate(cfg["featurizer"]["drugfeaturizer"], device, _recursive_=False)
-    prot_featurizer = hydra.utils.instantiate(cfg["featurizer"]["protfeaturizer"], device, _recursive_=False)
 
-    unique_drugs = data[["Drug_ID", "SMILES"]].drop_duplicates().sort_values("Drug_ID")
-    unique_targets = data[["Prot_ID", "SEQ"]].drop_duplicates().sort_values("Prot_ID")
-
-    drug_features = drug_featurizer.get_representations(unique_drugs["SMILES"].values)
-    target_features = prot_featurizer.get_representations(unique_targets["SEQ"].values)
-
-    X_drug = pd.DataFrame(drug_features, index=unique_drugs["Drug_ID"].values)
-    X_target = pd.DataFrame(target_features, index=unique_targets["Prot_ID"].values)
-
-    torch.save(X_drug, drug_cache)
-    torch.save(X_target, prot_cache)
-    return X_drug, X_target
+def serialize_custom_features(args, experiment, overrides) -> None:
+    cfg = load_scenario_config(experiment, overrides)
+    raw = load_input_table(args.input_csv)
+    data, _ = build_pair_table(raw)
+    X_drug, X_target = custom_entity_tables(data)
+    materialize_serialized_features(
+        cfg,
+        X_drug,
+        X_target,
+        save_path=args.custom_serialized_dir,
+        load_serialized=False,
+        device=torch.device("cuda" if args.use_gpu and torch.cuda.is_available() else "cpu"),
+    )
 
 
 def find_experiment(dataset: str, scenario: str):
@@ -210,13 +220,20 @@ def main():
     args.benchmark_serialized_dir.mkdir(parents=True, exist_ok=True)
     args.custom_serialized_dir.mkdir(parents=True, exist_ok=True)
 
+    overrides, _, _, _ = scenario_overrides(args, experiment)
+
+    if args.serialize_only:
+        serialize_custom_features(args, experiment, overrides)
+        return
+
     ensure_serialized_features(make_reproduction_args(args), args.dataset)
     best_path, artifacts_root, overrides = run_training_scenario(args, experiment)
     cfg = load_scenario_config(experiment, overrides)
 
+    ensure_custom_serialized_features(args, experiment, overrides)
     raw = load_input_table(args.input_csv)
     data, pair_table = build_pair_table(raw)
-    X_drug, X_target = featurize_unique_entities(cfg, data, args.custom_serialized_dir)
+    X_drug, X_target = load_serialized_entities(cfg, args.custom_serialized_dir)
 
     dataset = {
         "X_drug": X_drug,

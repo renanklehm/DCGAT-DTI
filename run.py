@@ -37,6 +37,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 import matplotlib.pyplot as plt
 import seaborn as sns
+from utils.feature_serialization import materialize_serialized_features
 
 
 
@@ -137,24 +138,16 @@ def main(cfg) -> Optional[float]:
     cfg['datamodule']['serializer']['drug_name'] = drug_name
     cfg['datamodule']['serializer']['target_name'] = target_name
 
-    if cfg['datamodule']['serializer']['load_serialized']:
-        X_drug = torch.load(save_path+drug_name)
-        X_target = torch.load(save_path+target_name)
-    else:
-        # Init featurizer model
-        drug_featurizer: LightningModule = hydra.utils.instantiate(
-                cfg['featurizer']['drugfeaturizer'], device, _recursive_=False
-        )
-       
-        X_drug_features = drug_featurizer.get_representations(X_drug.SMILES.values)
-        X_drug = pd.DataFrame(X_drug_features,index=X_drug.index)
-        torch.save(X_drug,save_path+drug_name)
-        prot_featurizer: LightningModule = hydra.utils.instantiate(
-            cfg['featurizer']['protfeaturizer'], device, _recursive_=False
-        )
-        X_target_features = prot_featurizer.get_representations(X_target.SEQ.values)
-        X_target = pd.DataFrame(X_target_features,index=X_target.index)
-        torch.save(X_target,save_path+target_name)
+    X_drug, X_target = materialize_serialized_features(
+        cfg,
+        X_drug,
+        X_target,
+        save_path=save_path,
+        drug_name=drug_name,
+        target_name=target_name,
+        device=device,
+    )
+    if not cfg['datamodule']['serializer']['load_serialized']:
         print(f'Rerun with load_serialized=True to load the serialized data from {save_path}')
         sys.exit()
         
