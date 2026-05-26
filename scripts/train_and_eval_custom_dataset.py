@@ -218,13 +218,24 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train on a paper scenario and evaluate on a custom single-table dataset.")
     parser.add_argument("--dataset", required=True, choices=("drugbank", "bindingDB", "yamanishi", "luo"), help="Benchmark dataset to use.")
     parser.add_argument("--scenario", required=True, help="Paper scenario key from reproduce_paper.py.")
-    parser.add_argument("--input-csv", required=True, type=Path, help="CSV with Canonical Smiles, Sequence, Activity Value Log, Activity Classification.")
+    parser.add_argument("--input-csv", required=True, type=Path, help="CSV or JSON with Canonical Smiles, Sequence, Activity Value Log, Activity Classification.")
     parser.add_argument("--artifacts-dir", required=True, type=Path, help="Directory for checkpoints and logs.")
     parser.add_argument("--serialized-dir", type=Path, default=REPO_ROOT / "datasets" / "custom_serialized", help="Directory for cached features.")
     parser.add_argument("--checkpoint-name", default="best.ckpt", help="Checkpoint filename to use for the trained model.")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--use-gpu", action="store_true", help="Use GPU if available.")
     return parser.parse_args()
+
+
+def load_input_table(path: Path) -> pd.DataFrame:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        return pd.read_json(path)
+    if suffix in {".jsonl", ".ndjson"}:
+        return pd.read_json(path, lines=True)
+    if suffix == ".csv":
+        return pd.read_csv(path)
+    raise ValueError(f"Unsupported input format: {path.suffix}")
 
 
 def normalize_activity(value: str) -> int:
@@ -366,7 +377,7 @@ def main():
     cfg = OmegaConf.to_container(cfg, resolve=True)
     cfg["datamodule"]["serializer"]["load_serialized"] = True
 
-    raw = pd.read_csv(args.input_csv)
+    raw = load_input_table(args.input_csv)
     data, pair_table = build_pair_table(raw)
     X_drug, X_target = featurize_unique_entities(data, args.serialized_dir)
 
