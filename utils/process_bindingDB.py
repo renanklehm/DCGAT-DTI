@@ -156,7 +156,10 @@ def BuildDataset(data,config):
         threshold = config['threshold']
         if isinstance(threshold, list):
             data = data[(data.label.values < threshold[0]) | (data.label.values > threshold[1])]
-        data['label'] = [1 if i else 0 for i in data.label.values < threshold[0]]
+            data['label'] = [1 if i else 0 for i in data.label.values < threshold[0]]
+        else:
+            cutoff = float(threshold)
+            data['label'] = [1 if i else 0 for i in data.label.values <= cutoff]
     else:
         if config['convert_to_log']:
             data['label'] = convert_y_unit(data.label.values, 'nM', 'p')

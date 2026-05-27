@@ -76,6 +76,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="BindingDB dataset directory used by the built-in scenario.",
     )
     parser.add_argument(
+        "--bindingdb-binary-threshold",
+        type=float,
+        help=(
+            "Override BindingDB binary labeling with a single cutoff in nM. "
+            "Pairs with affinity <= cutoff become active and > cutoff become inactive."
+        ),
+    )
+    parser.add_argument(
         "--yamanishi-root",
         type=Path,
         default=REPO_ROOT / "datasets" / "yamanishi_08",
@@ -127,6 +135,8 @@ def scenario_training_overrides(
         overrides.append(f"preprocess.data_path={normalize_dir(args.drugbank_root)}")
     elif dataset == "bindingDB":
         overrides.append(f"preprocess.data_path={normalize_dir(args.bindingdb_root)}")
+        if args.bindingdb_binary_threshold is not None:
+            overrides.append(f"preprocess.threshold={args.bindingdb_binary_threshold}")
     elif dataset == "yamanishi":
         overrides.append(f"preprocess.root_path={normalize_dir(args.yamanishi_root)}")
         overrides.append("multiprocessing.multiprocessing=True")
@@ -269,6 +279,7 @@ def main(argv: list[str] | None = None) -> None:
         "scenario": args.scenario,
         "trained_on_builtin_dataset": experiment.dataset,
         "best_param_name": experiment.best_param_name,
+        "bindingdb_binary_threshold": args.bindingdb_binary_threshold,
         "custom_data": str(args.custom_data.resolve()),
         "samples": sample_count,
         "excluded_rows": int(len(filtered_custom_data.excluded)),
