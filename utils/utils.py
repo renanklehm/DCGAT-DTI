@@ -200,6 +200,50 @@ def split(config,X_drug,X_target,y,ddi,skipped):
         val_ind = y[y['Prot_ID'].isin(val_target)]
         test_ind = y[y['Prot_ID'].isin(test_target)]
 
+    elif config['splitting_strategy'] == 'cold_full':
+        train_val_drug, test_drug = train_test_split(
+            np.unique(y.Drug_ID),
+            test_size=config['ratio'][2],
+            random_state=split_seed,
+        )
+        train_val_target, test_target = train_test_split(
+            np.unique(y.Prot_ID),
+            test_size=config['ratio'][2],
+            random_state=split_seed,
+        )
+        val_seed = None if split_seed is None else split_seed + 1
+        train_drug, val_drug = train_test_split(
+            train_val_drug,
+            test_size=config['ratio'][1],
+            random_state=val_seed,
+        )
+        train_target, val_target = train_test_split(
+            train_val_target,
+            test_size=config['ratio'][1],
+            random_state=val_seed,
+        )
+
+        train_ind = y[y['Drug_ID'].isin(train_drug) & y['Prot_ID'].isin(train_target)]
+        val_ind = y[y['Drug_ID'].isin(val_drug) & y['Prot_ID'].isin(val_target)]
+        test_ind = y[y['Drug_ID'].isin(test_drug) & y['Prot_ID'].isin(test_target)]
+
+        used_mask = (
+            (y['Drug_ID'].isin(train_drug) & y['Prot_ID'].isin(train_target))
+            | (y['Drug_ID'].isin(val_drug) & y['Prot_ID'].isin(val_target))
+            | (y['Drug_ID'].isin(test_drug) & y['Prot_ID'].isin(test_target))
+        )
+        unused_rows = int((~used_mask).sum())
+        if unused_rows:
+            print(
+                f'cold_full dropped {unused_rows} interaction rows that mixed '
+                'different drug/protein holdout partitions.'
+            )
+        if len(train_ind) == 0 or len(val_ind) == 0 or len(test_ind) == 0:
+            raise ValueError(
+                'cold_full produced an empty train/val/test split. '
+                'Try a different seed or larger validation/test ratios.'
+            )
+
     if config['balanced']:
         train_ind = new_balancing(train_ind, rng=rng)
         val_ind = new_balancing(val_ind, rng=rng)

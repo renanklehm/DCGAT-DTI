@@ -25,7 +25,23 @@ After downloading, extract the zip file in the **Datasets** directory. There are
 ---
 
 ## 🔧 Running Different Configurations
-You can run the model in **six different settings** per dataset based on whether the data is **balanced** or **unbalanced**, and the **splitting strategy**.
+You can run the model in built-in warm, cold-drug, cold-target, and cold-full settings depending on whether the data is **balanced** or **unbalanced**.
+
+## Common Entrypoint
+
+You can now access the repo workflows through a single routed CLI:
+
+```bash
+python main.py --help
+```
+
+Available commands:
+
+```bash
+python main.py reproduce-paper --help
+python main.py train-existing-eval-custom --help
+python main.py train-custom --help
+```
 
 ---
 
@@ -40,6 +56,9 @@ python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=Fa
 # Balanced - Cold Start for Protein
 python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=True" "datamodule.splitting.splitting_strategy=cold_target"
 
+# Balanced - Cold Start for Drug and Protein
+python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=True" "datamodule.splitting.splitting_strategy=cold_full"
+
 # Unbalanced - Warm Start
 python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=random"
 
@@ -48,6 +67,9 @@ python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=Fa
 
 # Unbalanced - Cold Start for Protein
 python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=cold_target"
+
+# Unbalanced - Cold Start for Drug and Protein
+python run.py --config-name drugbank_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=cold_full"
 ```
 
 ### 🧪 BindingDB Dataset
@@ -61,6 +83,9 @@ python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=F
 # Balanced - Cold Start for Protein
 python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=True" "datamodule.splitting.splitting_strategy=cold_target"
 
+# Balanced - Cold Start for Drug and Protein
+python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=True" "datamodule.splitting.splitting_strategy=cold_full"
+
 # Unbalanced - Warm Start
 python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=random"
 
@@ -69,6 +94,9 @@ python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=F
 
 # Unbalanced - Cold Start for Protein
 python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=cold_target"
+
+# Unbalanced - Cold Start for Drug and Protein
+python run.py --config-name bindingDB_train_GAT.yaml "tuning.param_search.tune=False" "datamodule.splitting.balanced=False" "datamodule.splitting.splitting_strategy=cold_full"
 ```
 
 ### 🧬 Yamanishi_08 Dataset
@@ -142,7 +170,98 @@ Follow these steps to integrate your own custom dataset:
    ```
 
 3. **Update Configuration**  
-   - Add a new `train.yaml` (e.g., `bindingDB_train_GAT.yaml`) in the `configs/` directory to define preprocessing and datamodule settings.
+    - Add a new `train.yaml` (e.g., `bindingDB_train_GAT.yaml`) in the `configs/` directory to define preprocessing and datamodule settings.
+
+## Quick Tutorial
+
+The custom-data scripts expect a dataset with three fields in this order:
+
+```text
+smiles|sequence|activation
+```
+
+Example row:
+
+```text
+CCO|MTEITAAMVKELRESTGAGMMDCKNALSETQHEWAY|1
+```
+
+You can also use JSON records with `smiles`, `sequence`, and `activation` keys.
+
+### 1. Train on an existing paper scenario and evaluate on your custom dataset
+
+This keeps the original behavior of `train_existing_scenario_and_eval_custom.py`:
+
+```bash
+python main.py train-existing-eval-custom \
+  --scenario drugbank:balanced_warm \
+  --custom-data path/to/custom.csv \
+  --has-header
+```
+
+You can also use the new built-in `cold_full` scenarios here:
+
+```bash
+python main.py train-existing-eval-custom \
+  --scenario drugbank:balanced_cold_full \
+  --custom-data path/to/custom.csv \
+  --has-header
+```
+
+Outputs are written under `artifacts/custom_eval/...` and include:
+
+- prepared custom tables
+- exclusion reports for invalid rows
+- prediction exports with probabilities
+- the selected checkpoint
+- a `.safetensors` export
+- `metrics.json`
+
+### 2. Train, evaluate, and export directly on your custom dataset
+
+This is the new workflow added in this change. It trains on a split of your custom dataset, evaluates on the held-out test split, and exports predictions plus weights.
+
+```bash
+python main.py train-custom \
+  --custom-data path/to/custom.csv \
+  --has-header \
+  --base-config drugbank_train_GAT.yaml \
+  --best-param-name random_balanced_GAT.yaml \
+  --split-strategy random \
+  --seed 42
+```
+
+Useful variants:
+
+```bash
+python main.py train-custom --custom-data path/to/custom.csv --has-header --split-strategy cold_drug
+python main.py train-custom --custom-data path/to/custom.csv --has-header --split-strategy cold_target
+python main.py train-custom --custom-data path/to/custom.csv --has-header --split-strategy cold_full
+python main.py train-custom --custom-data path/to/custom.csv --has-header --no-balanced --unbalanced-ratio 10
+python main.py train-custom --custom-data path/to/custom.csv --has-header --reuse-custom-embeddings
+```
+
+Outputs are written under `artifacts/custom_training/...` and include:
+
+- `prepared_data/drug_table.tsv`
+- `prepared_data/protein_table.tsv`
+- `prepared_data/relation_table.tsv`
+- `prepared_data/split_table.tsv`
+- `exports/predictions_with_scores.csv`
+- `exports/*.safetensors`
+- `metrics.json`
+
+The exported predictions file keeps the same custom-data-oriented format as the existing custom evaluation script, and in the new training flow it also adds a `split` column so you can see whether each kept row was used for `train`, `val`, or `test`.
+
+`cold_full` is stricter than `cold_drug` and `cold_target`: it holds out both a set of drugs and a set of proteins from training. Rows that mix different holdout partitions are marked as `unused` in the predictions export and are not used for train/val/test metrics.
+
+### 3. Reproduce the paper runs
+
+```bash
+python main.py reproduce-paper --datasets drugbank bindingDB
+```
+
+`reproduce-paper` now also includes the built-in `balanced_cold_full` and `unbalanced_cold_full` scenarios for DrugBank and BindingDB. Those runs currently reuse the closest existing cold-start best-parameter files because the repo does not yet have dedicated tuned `cold_full` parameter YAMLs.
 
 ---
 

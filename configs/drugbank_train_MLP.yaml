@@ -18,7 +18,7 @@ best_param_path: './configs/best_params/'
 best_param_name: 'random_balanced.yaml'
 
 multiprocessing:
-  multiprocessing: False
+  multiprocessing: True
   num_process: 10
   concurrent_process: 10
 

@@ -2,281 +2,25 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import platform
 import re
-import shlex
 import statistics
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-RUN_PY = REPO_ROOT / "run.py"
-
-
-@dataclass(frozen=True)
-class Experiment:
-    dataset: str
-    config_name: str
-    scenario_key: str
-    paper_label: str
-    repeats: int
-    best_param_name: str
-    overrides: tuple[str, ...] = ()
-
-
-DRUGBANK_BINDINGDB_EXPERIMENTS = (
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="balanced_warm",
-        paper_label="Balanced Warm Start",
-        repeats=10,
-        best_param_name="random_balanced_GAT.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=random",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="balanced_cold_drug",
-        paper_label="Balanced Cold Start for Drug",
-        repeats=10,
-        best_param_name="cold_drug_balanced_GAT.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=cold_drug",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="balanced_cold_target",
-        paper_label="Balanced Cold Start for Protein",
-        repeats=10,
-        best_param_name="cold_target_balanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=cold_target",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="unbalanced_warm",
-        paper_label="Unbalanced Warm Start",
-        repeats=10,
-        best_param_name="random_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=random",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="unbalanced_cold_drug",
-        paper_label="Unbalanced Cold Start for Drug",
-        repeats=10,
-        best_param_name="cold_drug_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=cold_drug",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="drugbank",
-        config_name="drugbank_train_GAT.yaml",
-        scenario_key="unbalanced_cold_target",
-        paper_label="Unbalanced Cold Start for Protein",
-        repeats=10,
-        best_param_name="cold_target_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=cold_target",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="balanced_warm",
-        paper_label="Balanced Warm Start",
-        repeats=10,
-        best_param_name="random_balanced_GAT.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=random",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="balanced_cold_drug",
-        paper_label="Balanced Cold Start for Drug",
-        repeats=10,
-        best_param_name="cold_drug_balanced_GAT.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=cold_drug",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="balanced_cold_target",
-        paper_label="Balanced Cold Start for Protein",
-        repeats=10,
-        best_param_name="cold_target_balanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=True",
-            "datamodule.splitting.splitting_strategy=cold_target",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="unbalanced_warm",
-        paper_label="Unbalanced Warm Start",
-        repeats=10,
-        best_param_name="random_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=random",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="unbalanced_cold_drug",
-        paper_label="Unbalanced Cold Start for Drug",
-        repeats=10,
-        best_param_name="cold_drug_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=cold_drug",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
-    Experiment(
-        dataset="bindingDB",
-        config_name="bindingDB_train_GAT.yaml",
-        scenario_key="unbalanced_cold_target",
-        paper_label="Unbalanced Cold Start for Protein",
-        repeats=10,
-        best_param_name="cold_target_unbalanced.yaml",
-        overrides=(
-            "datamodule.splitting.balanced=False",
-            "datamodule.splitting.splitting_strategy=cold_target",
-            "multiprocessing.multiprocessing=False",
-        ),
-    ),
+from scripts.common import (
+    ALL_EXPERIMENTS,
+    REPO_ROOT,
+    RUN_PY,
+    SERIALIZED_FILES,
+    Experiment,
+    normalize_dir,
+    run_command,
 )
 
 
-# These two datasets are provided as 10 predefined folds by the upstream source used in the paper.
-# The repository's preprocessors already iterate across all 10 folds, so each scenario is one run.
-FOLD_EXPERIMENTS = (
-    Experiment(
-        dataset="yamanishi",
-        config_name="yamanishi_train.yaml",
-        scenario_key="warm_start_1_1",
-        paper_label="Balanced Warm Start",
-        repeats=1,
-        best_param_name="yamanishi_GAT.yaml",
-        overrides=("preprocess.data_path=data_folds/warm_start_1_1/",),
-    ),
-    Experiment(
-        dataset="yamanishi",
-        config_name="yamanishi_train.yaml",
-        scenario_key="warm_start_1_10",
-        paper_label="Unbalanced Warm Start",
-        repeats=1,
-        best_param_name="yamanishi.yaml",
-        overrides=("preprocess.data_path=data_folds/warm_start_1_10/",),
-    ),
-    Experiment(
-        dataset="yamanishi",
-        config_name="yamanishi_train.yaml",
-        scenario_key="drug_coldstart",
-        paper_label="Cold Start for Drug",
-        repeats=1,
-        best_param_name="yamanishi_colddrug.yaml",
-        overrides=("preprocess.data_path=data_folds/drug_coldstart/",),
-    ),
-    Experiment(
-        dataset="yamanishi",
-        config_name="yamanishi_train.yaml",
-        scenario_key="protein_coldstart",
-        paper_label="Cold Start for Protein",
-        repeats=1,
-        best_param_name="yamanishi.yaml",
-        overrides=("preprocess.data_path=data_folds/protein_coldstart/",),
-    ),
-    Experiment(
-        dataset="luo",
-        config_name="luo_train.yaml",
-        scenario_key="warm_start_1_1",
-        paper_label="Balanced Warm Start",
-        repeats=1,
-        best_param_name="luo_GAT.yaml",
-        overrides=("preprocess.data_path=data_folds/warm_start_1_1/",),
-    ),
-    Experiment(
-        dataset="luo",
-        config_name="luo_train.yaml",
-        scenario_key="warm_start_1_10",
-        paper_label="Unbalanced Warm Start",
-        repeats=1,
-        best_param_name="luo.yaml",
-        overrides=("preprocess.data_path=data_folds/warm_start_1_10/",),
-    ),
-    Experiment(
-        dataset="luo",
-        config_name="luo_train.yaml",
-        scenario_key="drug_coldstart",
-        paper_label="Cold Start for Drug",
-        repeats=1,
-        best_param_name="luo.yaml",
-        overrides=("preprocess.data_path=data_folds/drug_coldstart/",),
-    ),
-    Experiment(
-        dataset="luo",
-        config_name="luo_train.yaml",
-        scenario_key="protein_coldstart",
-        paper_label="Cold Start for Protein",
-        repeats=1,
-        best_param_name="luo_protcoldstart.yaml",
-        overrides=("preprocess.data_path=data_folds/protein_coldstart/",),
-    ),
-)
-
-
-ALL_EXPERIMENTS = DRUGBANK_BINDINGDB_EXPERIMENTS + FOLD_EXPERIMENTS
-
-SERIALIZED_FILES = {
-    "drugbank": ("DrugBank_PubChem10M.pt", "DrugBank_ESM.pt"),
-    "bindingDB": ("bindingDB_Kd_PubChem10M.pt", "bindingDB_Kd_ESM.pt"),
-    "yamanishi": ("yamanishi_PubChem10M.pt", "yamanishi_ESM.pt"),
-    "luo": ("luo_PubChem10M.pt", "luo_ESM.pt"),
-}
-
-
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reproduce the paper experiments on Linux with a CUDA-capable GPU.")
     parser.add_argument(
         "--datasets",
@@ -348,7 +92,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip the Linux and GPU availability checks.",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def ensure_supported_environment(skip_checks: bool) -> None:
@@ -359,18 +103,9 @@ def ensure_supported_environment(skip_checks: bool) -> None:
         raise SystemExit("This reproduction script is intended for Linux only.")
 
     try:
-        subprocess.run(
-            ["nvidia-smi"],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:  # pragma: no cover - defensive CLI guard
+        subprocess.run(["nvidia-smi"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as exc:
         raise SystemExit("A visible NVIDIA GPU is required for these experiments.") from exc
-
-
-def normalize_dir(path: Path) -> str:
-    return path.resolve().as_posix().rstrip("/") + "/"
 
 
 def hydra_override(value: str) -> str:
@@ -389,12 +124,15 @@ def base_overrides(args: argparse.Namespace, experiment: Experiment, run_tag: st
         hydra_override("callbacks.model_checkpoint.save_last=False"),
         hydra_override(f"datamodule.serializer.save_path={normalize_dir(args.serialized_dir)}"),
         hydra_override(f"logger.name={experiment.dataset}"),
-        hydra_override(f"hydra.run.dir={normalize_dir(args.artifacts_dir / 'hydra_runs' / experiment.dataset / experiment.scenario_key / run_tag)}"),
+        hydra_override(
+            f"hydra.run.dir={normalize_dir(args.artifacts_dir / 'hydra_runs' / experiment.dataset / experiment.scenario_key / run_tag)}"
+        ),
         hydra_override("hydra.output_subdir=null"),
         hydra_override("hydra.job.chdir=False"),
     ]
 
-    # Keep the hardcoded TensorBoard path inside the repo tree.
+    import os
+
     os.environ.setdefault("TENSORBOARD_LOG_DIR", str(tensorboard_dir))
 
     if experiment.dataset == "drugbank":
@@ -414,23 +152,6 @@ def base_overrides(args: argparse.Namespace, experiment: Experiment, run_tag: st
 
     overrides.extend(experiment.overrides)
     return overrides
-
-
-def run_command(command: list[str], log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write("COMMAND: " + shlex.join(command) + "\n\n")
-        log_file.flush()
-        process = subprocess.run(
-            command,
-            cwd=REPO_ROOT,
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            check=False,
-            text=True,
-        )
-    if process.returncode != 0:
-        raise RuntimeError(f"Command failed with exit code {process.returncode}: {shlex.join(command)}")
 
 
 def parse_single_run_metrics(log_text: str) -> tuple[float, float]:
@@ -501,8 +222,8 @@ def summarize(values: list[float]) -> tuple[float, float]:
     return mean_value, std_value
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     ensure_supported_environment(args.skip_env_checks)
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -540,7 +261,9 @@ def main() -> None:
                 try:
                     parse_metrics_for_experiment(experiment, cached_log_text)
                 except ValueError:
-                    print(f"Re-running {experiment.dataset}/{experiment.scenario_key}/{run_tag} because cached log has no final metrics.")
+                    print(
+                        f"Re-running {experiment.dataset}/{experiment.scenario_key}/{run_tag} because cached log has no final metrics."
+                    )
                 else:
                     log_text = cached_log_text
 
@@ -552,7 +275,6 @@ def main() -> None:
                 log_text = log_path.read_text(encoding="utf-8")
 
             auc, auprc = parse_metrics_for_experiment(experiment, log_text)
-
             auc_values.append(auc)
             auprc_values.append(auprc)
 
