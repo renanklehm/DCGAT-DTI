@@ -247,6 +247,7 @@ Outputs are written under `artifacts/custom_training/...` and include:
 - `prepared_data/protein_table.tsv`
 - `prepared_data/relation_table.tsv`
 - `prepared_data/split_table.tsv`
+- `logs/train.log`
 - `exports/predictions_with_scores.csv`
 - `exports/*.safetensors`
 - `metrics.json`

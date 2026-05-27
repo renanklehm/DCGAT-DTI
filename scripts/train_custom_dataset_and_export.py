@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import shlex
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +173,22 @@ def train_custom_model(cfg_dict: dict[str, Any], dataset: dict[str, Any], tensor
     trainer.test(model, data_module)
 
 
+def run_training_with_log(
+    cfg_dict: dict[str, Any],
+    dataset: dict[str, Any],
+    tensorboard_root: Path,
+    log_path: Path,
+    argv: list[str] | None,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(REPO_ROOT / "main.py"), "train-custom", *(argv or sys.argv[1:])]
+    with log_path.open("w", encoding="utf-8") as handle:
+        handle.write("COMMAND: " + shlex.join(command) + "\n\n")
+        handle.flush()
+        with contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle):
+            train_custom_model(cfg_dict, dataset, tensorboard_root)
+
+
 def split_assignments(dataset: dict[str, Any]):
     import pandas as pd
 
@@ -205,10 +224,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     run_root = args.artifacts_dir / run_name
     prepared_dir = run_root / "prepared_data"
+    logs_dir = run_root / "logs"
     checkpoint_dir = run_root / "checkpoints"
     export_dir = run_root / "exports"
     tensorboard_root = run_root / "tensorboard"
     report_path = run_root / "metrics.json"
+    train_log_path = logs_dir / "train.log"
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     args.serialized_dir.mkdir(parents=True, exist_ok=True)
@@ -255,7 +276,7 @@ def main(argv: list[str] | None = None) -> None:
     os.environ.setdefault("TENSORBOARD_LOG_DIR", str(tensorboard_root))
 
     if not args.skip_training:
-        train_custom_model(cfg_dict, dataset_for_training, tensorboard_root)
+        run_training_with_log(cfg_dict, dataset_for_training, tensorboard_root, train_log_path, argv)
 
     checkpoint_path = pick_checkpoint(checkpoint_dir)
 
@@ -326,6 +347,7 @@ def main(argv: list[str] | None = None) -> None:
         "exclusions": None if exclusions_report is None else {key: str(path.resolve()) for key, path in exclusions_report.items()},
         "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
         "prediction_exports": {key: str(path.resolve()) for key, path in prediction_exports.items()},
+        "logs": {"train": str(train_log_path.resolve())},
         "checkpoint": str(checkpoint_path.resolve()),
         "safetensors": str(safetensors_path.resolve()),
         "metrics": metrics,
@@ -343,6 +365,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"Predictions export: {prediction_exports['csv']}")
     if "json" in prediction_exports:
         print(f"Predictions export JSON: {prediction_exports['json']}")
+    print(f"Training log: {train_log_path}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Safetensors: {safetensors_path}")
     print(f"Custom test AUC: {metrics['test_auc']:.6f}")

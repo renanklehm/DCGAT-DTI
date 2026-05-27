@@ -64,6 +64,165 @@ def new_balancing(y, ratio=1, rng=None):
     y = y.iloc[ind]
     return y  
 
+
+def _cold_full_partition_entities(entity_ids, ratio, split_seed):
+    train_val_ids, test_ids = train_test_split(
+        entity_ids,
+        test_size=ratio[2],
+        random_state=split_seed,
+    )
+    val_seed = None if split_seed is None else split_seed + 1
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=ratio[1],
+        random_state=val_seed,
+    )
+
+    labels = np.empty(len(entity_ids), dtype=np.int8)
+    labels[np.searchsorted(entity_ids, train_ids)] = 0
+    labels[np.searchsorted(entity_ids, val_ids)] = 1
+    labels[np.searchsorted(entity_ids, test_ids)] = 2
+    return labels
+
+
+def _cold_full_split_scores(entity_ids, row_entity_ids, other_labels):
+    scores = (
+        pd.DataFrame({"entity": row_entity_ids, "other_split": other_labels})
+        .groupby(["entity", "other_split"])
+        .size()
+        .unstack(fill_value=0)
+        .reindex(index=entity_ids, fill_value=0)
+        .reindex(columns=[0, 1, 2], fill_value=0)
+    )
+    return scores.to_numpy(dtype=np.int64)
+
+
+def _cold_full_improve_labels(scores, labels, rng, max_passes=6):
+    labels = labels.copy()
+    split_pairs = [(0, 1), (0, 2), (1, 2)]
+
+    for _ in range(max_passes):
+        improved = False
+        pair_order = list(split_pairs)
+        rng.shuffle(pair_order)
+
+        for left_split, right_split in pair_order:
+            left_idx = np.flatnonzero(labels == left_split)
+            right_idx = np.flatnonzero(labels == right_split)
+            if len(left_idx) == 0 or len(right_idx) == 0:
+                continue
+
+            left_gain = scores[left_idx, right_split] - scores[left_idx, left_split]
+            right_gain = scores[right_idx, left_split] - scores[right_idx, right_split]
+
+            left_mask = left_gain > 0
+            right_mask = right_gain > 0
+            if not left_mask.any() or not right_mask.any():
+                continue
+
+            left_candidates = left_idx[left_mask]
+            right_candidates = right_idx[right_mask]
+            left_gain = left_gain[left_mask]
+            right_gain = right_gain[right_mask]
+
+            left_order = np.argsort(left_gain)[::-1]
+            right_order = np.argsort(right_gain)[::-1]
+            pair_count = min(len(left_order), len(right_order))
+
+            for pair_idx in range(pair_count):
+                if left_gain[left_order[pair_idx]] + right_gain[right_order[pair_idx]] <= 0:
+                    break
+                labels[left_candidates[left_order[pair_idx]]] = right_split
+                labels[right_candidates[right_order[pair_idx]]] = left_split
+                improved = True
+
+        if not improved:
+            break
+
+    return labels
+
+
+def _cold_full_materialize_splits(y, drug_ids, drug_labels, target_ids, target_labels):
+    drug_lookup = pd.Series(drug_labels, index=drug_ids)
+    target_lookup = pd.Series(target_labels, index=target_ids)
+    row_drug_labels = y['Drug_ID'].map(drug_lookup).to_numpy(dtype=np.int8)
+    row_target_labels = y['Prot_ID'].map(target_lookup).to_numpy(dtype=np.int8)
+    row_labels = np.where(row_drug_labels == row_target_labels, row_drug_labels, -1)
+    return (
+        y[row_labels == 0],
+        y[row_labels == 1],
+        y[row_labels == 2],
+        int((row_labels == -1).sum()),
+    )
+
+
+def _cold_full_has_both_classes(split_df):
+    labels = set(split_df['label'].astype(int).unique().tolist())
+    return 0 in labels and 1 in labels
+
+
+def _optimized_cold_full_split(config, y):
+    split_seed = config.get('seed')
+    drug_ids = np.sort(np.unique(y.Drug_ID)).astype(int, copy=False)
+    target_ids = np.sort(np.unique(y.Prot_ID)).astype(int, copy=False)
+
+    best_candidate = None
+    best_score = None
+    best_balanced_candidate = None
+    best_balanced_score = None
+
+    for attempt in range(6):
+        attempt_seed = None if split_seed is None else split_seed + attempt * 97
+        attempt_rng = np.random.RandomState(attempt_seed) if attempt_seed is not None else np.random
+
+        drug_labels = _cold_full_partition_entities(drug_ids, config['ratio'], attempt_seed)
+        target_labels = _cold_full_partition_entities(target_ids, config['ratio'], attempt_seed)
+
+        # Alternate drug/protein reassignment while keeping per-split entity counts fixed.
+        for _ in range(6):
+            prev_drug_labels = drug_labels.copy()
+            prev_target_labels = target_labels.copy()
+
+            target_lookup = pd.Series(target_labels, index=target_ids)
+            target_row_labels = y['Prot_ID'].map(target_lookup).to_numpy(dtype=np.int8)
+            drug_scores = _cold_full_split_scores(drug_ids, y['Drug_ID'].to_numpy(), target_row_labels)
+            drug_labels = _cold_full_improve_labels(drug_scores, drug_labels, attempt_rng)
+
+            drug_lookup = pd.Series(drug_labels, index=drug_ids)
+            drug_row_labels = y['Drug_ID'].map(drug_lookup).to_numpy(dtype=np.int8)
+            target_scores = _cold_full_split_scores(target_ids, y['Prot_ID'].to_numpy(), drug_row_labels)
+            target_labels = _cold_full_improve_labels(target_scores, target_labels, attempt_rng)
+
+            if np.array_equal(drug_labels, prev_drug_labels) and np.array_equal(target_labels, prev_target_labels):
+                break
+
+        train_ind, val_ind, test_ind, unused_rows = _cold_full_materialize_splits(
+            y,
+            drug_ids,
+            drug_labels,
+            target_ids,
+            target_labels,
+        )
+
+        score = (len(train_ind) + len(val_ind) + len(test_ind), len(val_ind), len(train_ind), -unused_rows)
+        candidate = (train_ind, val_ind, test_ind, unused_rows)
+        if best_score is None or score > best_score:
+            best_candidate = candidate
+            best_score = score
+
+        if all(len(split_df) > 0 for split_df in candidate[:3]) and (
+            not config['balanced'] or all(_cold_full_has_both_classes(split_df) for split_df in candidate[:3])
+        ):
+            if best_balanced_score is None or score > best_balanced_score:
+                best_balanced_candidate = candidate
+                best_balanced_score = score
+
+    if best_balanced_candidate is not None:
+        return best_balanced_candidate
+    if best_candidate is None:
+        raise ValueError('cold_full could not construct any train/val/test split candidate.')
+    return best_candidate
+
 def split(config,X_drug,X_target,y,ddi,skipped):
     split_seed = config.get('seed')
     rng = np.random.RandomState(split_seed) if split_seed is not None else np.random
@@ -201,38 +360,7 @@ def split(config,X_drug,X_target,y,ddi,skipped):
         test_ind = y[y['Prot_ID'].isin(test_target)]
 
     elif config['splitting_strategy'] == 'cold_full':
-        train_val_drug, test_drug = train_test_split(
-            np.unique(y.Drug_ID),
-            test_size=config['ratio'][2],
-            random_state=split_seed,
-        )
-        train_val_target, test_target = train_test_split(
-            np.unique(y.Prot_ID),
-            test_size=config['ratio'][2],
-            random_state=split_seed,
-        )
-        val_seed = None if split_seed is None else split_seed + 1
-        train_drug, val_drug = train_test_split(
-            train_val_drug,
-            test_size=config['ratio'][1],
-            random_state=val_seed,
-        )
-        train_target, val_target = train_test_split(
-            train_val_target,
-            test_size=config['ratio'][1],
-            random_state=val_seed,
-        )
-
-        train_ind = y[y['Drug_ID'].isin(train_drug) & y['Prot_ID'].isin(train_target)]
-        val_ind = y[y['Drug_ID'].isin(val_drug) & y['Prot_ID'].isin(val_target)]
-        test_ind = y[y['Drug_ID'].isin(test_drug) & y['Prot_ID'].isin(test_target)]
-
-        used_mask = (
-            (y['Drug_ID'].isin(train_drug) & y['Prot_ID'].isin(train_target))
-            | (y['Drug_ID'].isin(val_drug) & y['Prot_ID'].isin(val_target))
-            | (y['Drug_ID'].isin(test_drug) & y['Prot_ID'].isin(test_target))
-        )
-        unused_rows = int((~used_mask).sum())
+        train_ind, val_ind, test_ind, unused_rows = _optimized_cold_full_split(config, y)
         if unused_rows:
             print(
                 f'cold_full dropped {unused_rows} interaction rows that mixed '
@@ -248,6 +376,11 @@ def split(config,X_drug,X_target,y,ddi,skipped):
         train_ind = new_balancing(train_ind, rng=rng)
         val_ind = new_balancing(val_ind, rng=rng)
         test_ind = new_balancing(test_ind, rng=rng)
+        if config['splitting_strategy'] == 'cold_full' and (len(train_ind) == 0 or len(val_ind) == 0 or len(test_ind) == 0):
+            raise ValueError(
+                'cold_full balancing removed all rows from at least one split. '
+                'Try a different seed, larger validation/test ratios, or an unbalanced cold_full scenario.'
+            )
     elif config['unbalanced_ratio']:
         train_ind = new_balancing(train_ind, config['unbalanced_ratio'], rng=rng)
         val_ind = new_balancing(val_ind, config['unbalanced_ratio'], rng=rng)
