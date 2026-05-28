@@ -198,7 +198,12 @@ def create_trainer(cfg_dict: dict[str, Any], tensorboard_root: Path):
     )
 
 
-def train_custom_model(cfg_dict: dict[str, Any], dataset: dict[str, Any], tensorboard_root: Path) -> None:
+def train_custom_model(
+    cfg_dict: dict[str, Any],
+    dataset: dict[str, Any],
+    tensorboard_root: Path,
+    resume_from_checkpoint: Path | None = None,
+) -> None:
     import hydra
     import pytorch_lightning as pl
     import torch
@@ -210,7 +215,8 @@ def train_custom_model(cfg_dict: dict[str, Any], dataset: dict[str, Any], tensor
     data_module = hydra.utils.instantiate(cfg_dict["datamodule"], cfg_dict, dataset, _recursive_=False)
     model = hydra.utils.instantiate(cfg_dict["module"], cfg_dict, dataset, _recursive_=False)
     trainer = create_trainer(cfg_dict, tensorboard_root)
-    trainer.fit(model, data_module)
+    ckpt_path = None if resume_from_checkpoint is None else str(resume_from_checkpoint)
+    trainer.fit(model, data_module, ckpt_path=ckpt_path)
     trainer.validate(model, data_module)
     trainer.test(model, data_module)
 
@@ -222,6 +228,7 @@ def run_training_with_log(
     log_path: Path,
     argv: list[str] | None,
     command_name: str = "train-custom",
+    resume_from_checkpoint: Path | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     command = [sys.executable, str(REPO_ROOT / "main.py"), command_name, *(argv or sys.argv[1:])]
@@ -229,7 +236,7 @@ def run_training_with_log(
         handle.write("COMMAND: " + shlex.join(command) + "\n\n")
         handle.flush()
         with contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle):
-            train_custom_model(cfg_dict, dataset, tensorboard_root)
+            train_custom_model(cfg_dict, dataset, tensorboard_root, resume_from_checkpoint=resume_from_checkpoint)
 
 
 def split_assignments(dataset: dict[str, Any]):

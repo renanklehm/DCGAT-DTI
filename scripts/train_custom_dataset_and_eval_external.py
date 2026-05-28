@@ -138,6 +138,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Skip training and only evaluate/export from an existing checkpoint in the run directory.",
     )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        type=Path,
+        default=None,
+        help="Resume training from a saved Lightning checkpoint.",
+    )
     return parser.parse_args(argv)
 
 
@@ -266,6 +272,7 @@ def main(argv: list[str] | None = None) -> None:
             train_log_path,
             argv,
             command_name="train-custom-test-custom",
+            resume_from_checkpoint=args.resume_from_checkpoint,
         )
 
     checkpoint_path = pick_checkpoint(checkpoint_dir)
