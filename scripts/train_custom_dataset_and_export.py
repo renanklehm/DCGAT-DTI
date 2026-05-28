@@ -88,6 +88,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for custom splitting and training.")
     parser.add_argument("--max-epochs", type=int, default=None, help="Optional override for trainer.max_epochs.")
     parser.add_argument(
+        "--train-batch-size",
+        type=int,
+        default=None,
+        help="Optional override for training/validation/test dataloader batch size.",
+    )
+    parser.add_argument(
+        "--train-num-workers",
+        type=int,
+        default=None,
+        help="Optional override for dataloader worker count.",
+    )
+    parser.add_argument(
         "--serialized-dir",
         type=Path,
         default=DEFAULT_SERIALIZED_DIR,
@@ -151,6 +163,10 @@ def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoin
     ]
     if args.max_epochs is not None:
         overrides.append(f"trainer.max_epochs={args.max_epochs}")
+    if args.train_batch_size is not None:
+        overrides.append(f"datamodule.dm_cfg.batch_size={args.train_batch_size}")
+    if args.train_num_workers is not None:
+        overrides.append(f"datamodule.dm_cfg.num_workers={args.train_num_workers}")
     return overrides
 
 
