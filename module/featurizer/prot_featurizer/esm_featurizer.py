@@ -48,17 +48,19 @@
 #         return np.array(sequence_representations)
 
 
-import esm, torch, sys, os
+import esm, torch
 import numpy as np
 from tqdm import tqdm
 
 
 class ESMFEATURE:
-    def __init__(self,device):
+    def __init__(self, device, batch_size=4):
         self.model, self.alphabet = esm.pretrained.esm2_t33_650M_UR50D()
         self.model = self.model.to(device)
+        self.model.eval()
         self.batch_converter = self.alphabet.get_batch_converter()
         self.device = device
+        self.batch_size = batch_size
 
     def get_representations(self, X_target):
 
@@ -66,10 +68,9 @@ class ESMFEATURE:
         for i in range(len(X_target)):
             data.append(("protein"+str(i),X_target[i]))
         
-        batch_size = 1
-        data = [data[i * batch_size:(i + 1) * batch_size] for i in range((len(data) + batch_size - 1) // batch_size )]
+        batch_size = self.batch_size
+        data = [data[i * batch_size:(i + 1) * batch_size] for i in range((len(data) + batch_size - 1) // batch_size)]
         # Process batches (this supports multiple sequence inputs)
-        self.model.eval()  # disables dropout for deterministic results
 
         sequence_representations = []    
         for temp_data in tqdm(data):
@@ -79,18 +80,17 @@ class ESMFEATURE:
             batch_tokens = batch_tokens.to(self.device)
 
             # Extract per-residue representations (on CPU)
-            with torch.no_grad():
-                results = self.model(batch_tokens, repr_layers=[33], return_contacts=True)
-            token_representations = results["representations"][33].to('cpu')
-            
+            with torch.inference_mode():
+                results = self.model(batch_tokens, repr_layers=[33], return_contacts=False)
+            token_representations = results["representations"][33]
+
             # Generate per-sequence representations via averaging
             # NOTE: token 0 is always a beginning-of-sequence token, so the first residue is token 1.
             for i, tokens_len in enumerate(batch_lens):
-                sequence_representations.append(token_representations[i, 1 : tokens_len - 1].mean(0))
+                sequence_representations.append(token_representations[i, 1 : tokens_len - 1].mean(0).cpu())
                 # print sequence representation shape
-                
-            del results, batch_tokens
-            torch.cuda.empty_cache() 
+
+            del results, token_representations, batch_tokens
 
         #use torch stack to convert list of tensors to tensor
         sequence_representations = torch.stack(sequence_representations)

@@ -105,6 +105,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Reuse existing serialized embeddings for the same dataset/settings when present.",
     )
     parser.add_argument(
+        "--drug-embed-batch-size",
+        type=int,
+        default=32,
+        help="Batch size for SMILES embedding generation.",
+    )
+    parser.add_argument(
+        "--target-embed-batch-size",
+        type=int,
+        default=4,
+        help="Batch size for protein embedding generation.",
+    )
+    parser.add_argument(
         "--skip-training",
         action="store_true",
         help="Skip training and only evaluate/export from an existing checkpoint in the run directory.",
@@ -129,6 +141,8 @@ def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoin
         "hydra.output_subdir=null",
         "hydra.job.chdir=False",
         "multiprocessing.multiprocessing=False",
+        f"featurizer.drugfeaturizer.batch_size={args.drug_embed_batch_size}",
+        f"featurizer.protfeaturizer.batch_size={args.target_embed_batch_size}",
         f"datamodule.splitting.splitting_strategy={normalize_split_strategy(args.split_strategy)}",
         f"datamodule.splitting.balanced={'True' if args.balanced else 'False'}",
         f"datamodule.splitting.unbalanced_ratio={args.unbalanced_ratio}",
