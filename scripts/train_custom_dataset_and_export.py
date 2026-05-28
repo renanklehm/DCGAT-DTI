@@ -227,11 +227,14 @@ def run_training_with_log(
     tensorboard_root: Path,
     log_path: Path,
     argv: list[str] | None,
-    command_name: str = "train-custom",
+    command_name: str | None = None,
     resume_from_checkpoint: Path | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(REPO_ROOT / "main.py"), command_name, *(argv or sys.argv[1:])]
+    command = [sys.executable, str(REPO_ROOT / "main.py")]
+    if command_name is not None:
+        command.append(command_name)
+    command.extend(argv or sys.argv[1:])
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write("COMMAND: " + shlex.join(command) + "\n\n")
         handle.flush()

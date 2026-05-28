@@ -430,6 +430,25 @@ def update_best_params(cfg: Any) -> dict[str, Any]:
     return utils.update_best_param(cfg_dict)
 
 
+def load_checkpoint_cfg_dict(checkpoint_path: Path) -> dict[str, Any] | None:
+    import torch
+    from omegaconf import OmegaConf
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    hyper_parameters = checkpoint.get("hyper_parameters")
+    if hyper_parameters is None:
+        return None
+
+    candidate = hyper_parameters.get("cfg", hyper_parameters) if isinstance(hyper_parameters, dict) else hyper_parameters
+    if not isinstance(candidate, dict):
+        candidate = OmegaConf.to_container(candidate, resolve=True)
+    if not isinstance(candidate, dict):
+        return None
+    if "module" not in candidate or "datamodule" not in candidate:
+        return None
+    return candidate
+
+
 def resolve_training_serializer_paths(cfg: Any) -> tuple[Path, Path]:
     from omegaconf import OmegaConf
 
