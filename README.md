@@ -41,6 +41,7 @@ Available commands:
 python main.py reproduce-paper --help
 python main.py train-existing-eval-custom --help
 python main.py train-custom --help
+python main.py train-custom-test-custom --help
 ```
 
 ---
@@ -186,7 +187,7 @@ Example row:
 CCO|MTEITAAMVKELRESTGAGMMDCKNALSETQHEWAY|1
 ```
 
-You can also use JSON records with `smiles`, `sequence`, and `activation` keys.
+You can also use JSON or Parquet records with `smiles`, `sequence`, and `activation` columns.
 
 ### 1. Train on an existing paper scenario and evaluate on your custom dataset
 
@@ -226,10 +227,11 @@ python main.py train-custom \
   --custom-data path/to/custom.csv \
   --has-header \
   --base-config drugbank_train_GAT.yaml \
-  --best-param-name random_balanced_GAT.yaml \
-  --split-strategy random \
+  --split-strategy warm \
   --seed 42
 ```
+
+When `--best-param-name` is omitted, custom-training workflows now use `configs/best_params/custom_default.yaml`.
 
 Useful variants:
 
@@ -239,6 +241,7 @@ python main.py train-custom --custom-data path/to/custom.csv --has-header --spli
 python main.py train-custom --custom-data path/to/custom.csv --has-header --split-strategy cold_full
 python main.py train-custom --custom-data path/to/custom.csv --has-header --no-balanced --unbalanced-ratio 10
 python main.py train-custom --custom-data path/to/custom.csv --has-header --reuse-custom-embeddings
+python main.py train-custom --custom-data path/to/custom.parquet --split-strategy warm
 ```
 
 Outputs are written under `artifacts/custom_training/...` and include:
@@ -256,7 +259,40 @@ The exported predictions file keeps the same custom-data-oriented format as the 
 
 `cold_full` is stricter than `cold_drug` and `cold_target`: it holds out both a set of drugs and a set of proteins from training. Rows that mix different holdout partitions are marked as `unused` in the predictions export and are not used for train/val/test metrics.
 
-### 3. Reproduce the paper runs
+### 3. Train on one custom dataset and test on another custom dataset
+
+This new workflow trains with the same built-in balancing and split modes, but evaluates on a separate custom file.
+
+```bash
+python main.py train-custom-test-custom \
+  --train-data path/to/train_custom.csv \
+  --train-has-header \
+  --test-data path/to/test_custom.parquet \
+  --base-config drugbank_train_GAT.yaml \
+  --split-strategy warm \
+  --seed 42
+```
+
+Useful variants:
+
+```bash
+python main.py train-custom-test-custom --train-data path/to/train.csv --train-has-header --test-data path/to/test.csv --test-has-header --split-strategy cold_drug
+python main.py train-custom-test-custom --train-data path/to/train.csv --train-has-header --test-data path/to/test.csv --test-has-header --split-strategy cold_target
+python main.py train-custom-test-custom --train-data path/to/train.csv --train-has-header --test-data path/to/test.csv --test-has-header --split-strategy cold_full
+python main.py train-custom-test-custom --train-data path/to/train.csv --train-has-header --test-data path/to/test.json --no-balanced --unbalanced-ratio 10
+```
+
+Outputs are written under `artifacts/custom_cross_dataset/...` and include:
+
+- prepared train and test tables
+- train split table for the training dataset
+- exclusion reports for invalid rows in both datasets
+- prediction exports for the external test dataset
+- the selected checkpoint
+- a `.safetensors` export
+- `metrics.json`
+
+### 4. Reproduce the paper runs
 
 ```bash
 python main.py reproduce-paper --datasets drugbank bindingDB

@@ -12,6 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("reproduce-paper", help="Run the paper reproduction workflow.")
     subparsers.add_parser("train-existing-eval-custom", help="Train a built-in scenario and evaluate on a custom dataset.")
     subparsers.add_parser("train-custom", help="Train, evaluate, and export on a custom dataset.")
+    subparsers.add_parser("train-custom-test-custom", help="Train on one custom dataset and test on a different custom dataset.")
     return parser
 
 
@@ -33,6 +34,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if command == "train-custom":
         importlib.import_module("scripts.train_custom_dataset_and_export").main(remaining)
+        return
+    if command == "train-custom-test-custom":
+        importlib.import_module("scripts.train_custom_dataset_and_eval_external").main(remaining)
         return
 
     parser.error(f"Unknown command: {command}")

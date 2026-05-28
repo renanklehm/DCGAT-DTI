@@ -316,6 +316,14 @@ FOLD_EXPERIMENTS = (
 
 ALL_EXPERIMENTS = DRUGBANK_BINDINGDB_EXPERIMENTS + FOLD_EXPERIMENTS
 
+SPLIT_STRATEGY_ALIASES = {
+    "warm": "random",
+    "random": "random",
+    "cold_drug": "cold_drug",
+    "cold_target": "cold_target",
+    "cold_full": "cold_full",
+}
+
 SERIALIZED_FILES = {
     "drugbank": ("DrugBank_PubChem10M.pt", "DrugBank_ESM.pt"),
     "bindingDB": ("bindingDB_Kd_PubChem10M.pt", "bindingDB_Kd_ESM.pt"),
@@ -341,6 +349,19 @@ def strip_yaml_suffix(config_name: str) -> str:
 def sanitize_slug(value: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip())
     return slug.strip("._-") or "custom"
+
+
+def normalize_split_strategy(value: str) -> str:
+    try:
+        return SPLIT_STRATEGY_ALIASES[value]
+    except KeyError as exc:
+        available = ", ".join(sorted(SPLIT_STRATEGY_ALIASES))
+        raise ValueError(f"Unknown split strategy '{value}'. Available values: {available}") from exc
+
+
+def default_best_param_name(split_strategy: str, balanced: bool) -> str:
+    normalize_split_strategy(split_strategy)
+    return "custom_default.yaml"
 
 
 def get_experiment(scenario: str) -> Experiment:

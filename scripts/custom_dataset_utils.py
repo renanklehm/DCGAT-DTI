@@ -30,17 +30,19 @@ def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> Filter
         frame = pd.read_csv(path, sep=delimiter, header=0 if has_header else None)
     elif suffix == ".json":
         frame = pd.read_json(path)
+    elif suffix == ".parquet":
+        frame = pd.read_parquet(path)
     else:
-        raise ValueError("Custom dataset must be a .csv or .json file.")
+        raise ValueError("Custom dataset must be a .csv, .json, or .parquet file.")
 
     if frame.empty:
         raise ValueError(f"No data rows were found in {path}")
 
-    if suffix == ".json":
+    if suffix in {".json", ".parquet"}:
         expected_columns = {"smiles", "sequence", "activation"}
         lowered = {str(column).strip().lower(): column for column in frame.columns}
         if not expected_columns.issubset(lowered):
-            raise ValueError("JSON input must contain columns named smiles, sequence, and activation.")
+            raise ValueError(f"{suffix} input must contain columns named smiles, sequence, and activation.")
         frame = frame.rename(
             columns={
                 lowered["smiles"]: "SMILES",
@@ -291,7 +293,7 @@ def save_prediction_export(
     export_frame.to_csv(csv_path, sep=delimiter, index=False)
 
     outputs = {"csv": csv_path}
-    if input_path.suffix.lower() == ".json":
+    if input_path.suffix.lower() in {".json", ".parquet"}:
         json_path = output_dir / "predictions_with_scores.json"
         json_path.write_text(export_frame.to_json(orient="records", indent=2), encoding="utf-8")
         outputs["json"] = json_path
