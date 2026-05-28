@@ -173,6 +173,15 @@ def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoin
     return overrides
 
 
+def apply_explicit_training_overrides(cfg_dict: dict[str, object], args: argparse.Namespace) -> dict[str, object]:
+    datamodule_cfg = cfg_dict["datamodule"]["dm_cfg"]
+    if args.train_batch_size is not None:
+        datamodule_cfg["batch_size"] = args.train_batch_size
+    if args.train_num_workers is not None:
+        datamodule_cfg["num_workers"] = args.train_num_workers
+    return cfg_dict
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     ensure_repo_on_path()
@@ -215,6 +224,7 @@ def main(argv: list[str] | None = None) -> None:
     training_overrides = build_training_overrides(args, run_root, checkpoint_dir)
     cfg = compose_cfg(args.base_config, training_overrides)
     cfg_dict = update_best_params(cfg)
+    cfg_dict = apply_explicit_training_overrides(cfg_dict, args)
 
     train_serializer_suffix = f"train_{args.base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
     train_drug_name, train_target_name = custom_serializer_names(args.train_data, train_serializer_suffix)

@@ -170,6 +170,15 @@ def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoin
     return overrides
 
 
+def apply_explicit_training_overrides(cfg_dict: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    datamodule_cfg = cfg_dict["datamodule"]["dm_cfg"]
+    if args.train_batch_size is not None:
+        datamodule_cfg["batch_size"] = args.train_batch_size
+    if args.train_num_workers is not None:
+        datamodule_cfg["num_workers"] = args.train_num_workers
+    return cfg_dict
+
+
 def create_trainer(cfg_dict: dict[str, Any], tensorboard_root: Path):
     import pytorch_lightning as pl
     import torch
@@ -280,6 +289,7 @@ def main(argv: list[str] | None = None) -> None:
     training_overrides = build_training_overrides(args, run_root, checkpoint_dir)
     cfg = compose_cfg(args.base_config, training_overrides)
     cfg_dict = update_best_params(cfg)
+    cfg_dict = apply_explicit_training_overrides(cfg_dict, args)
 
     serializer_suffix = f"{args.base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
     custom_drug_name, custom_target_name = custom_serializer_names(args.custom_data, serializer_suffix)
