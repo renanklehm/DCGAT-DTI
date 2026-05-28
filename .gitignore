@@ -220,3 +220,7 @@ __marimo__/
 .streamlit/secrets.toml
 
 data/*
+.python-version
+pyproject.toml
+uv.lock
+*.ipynb
