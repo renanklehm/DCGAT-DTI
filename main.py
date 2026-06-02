@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import pandas as pd
+
 from scripts.common import (
     REPO_ROOT,
     RUN_PY,
@@ -25,6 +27,7 @@ from scripts.common import (
     update_best_params,
 )
 from scripts.custom_dataset_utils import (
+    FilteredCustomData,
     build_custom_tables,
     build_prediction_dataset,
     custom_serializer_names,
@@ -70,6 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scenario", help="Built-in scenario to train, in dataset:scenario_key form.")
     parser.add_argument("--train-data", type=Path, help="Custom training dataset path.")
+    parser.add_argument("--dataset-1", type=Path, default=None, help="First custom training dataset path to merge before training.")
+    parser.add_argument("--dataset-2", type=Path, default=None, help="Second custom training dataset path to merge before training.")
     parser.add_argument(
         "--test-data",
         "--custom-data",
@@ -247,6 +252,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_mode(args: argparse.Namespace) -> str:
+    if (args.dataset_1 is None) != (args.dataset_2 is None):
+        raise ValueError("--dataset-1 and --dataset-2 must be provided together.")
+
+    if args.dataset_1 is not None:
+        if args.train_data is not None:
+            raise ValueError("--dataset-1/--dataset-2 cannot be combined with --train-data.")
+        args.train_data = args.dataset_1
+
     if args.finetune_checkpoint is not None:
         if args.checkpoint is not None:
             raise ValueError("--finetune-checkpoint cannot be combined with --checkpoint.")
@@ -315,6 +328,59 @@ def prepare_custom_dataset(path: Path, delimiter: str, has_header: bool, prepare
         "exclusions_report": exclusions_report,
         "relations_with_source": relations_with_source,
     }
+
+
+def prepare_training_dataset(args: argparse.Namespace, prepared_dir: Path) -> tuple[dict[str, Any], Path]:
+    if args.dataset_1 is None:
+        return (
+            prepare_custom_dataset(
+                args.train_data,
+                resolve_delimiter(args, "train"),
+                resolve_has_header(args, "train"),
+                prepared_dir,
+            ),
+            args.train_data,
+        )
+
+    dataset_1 = read_custom_triplets(args.dataset_1, resolve_delimiter(args, "train"), resolve_has_header(args, "train"))
+    dataset_2 = read_custom_triplets(args.dataset_2, resolve_delimiter(args, "train"), resolve_has_header(args, "train"))
+
+    merged_original = pd.concat([dataset_1.original, dataset_2.original], ignore_index=True)
+    merged_original = merged_original.copy()
+    merged_original["source_row"] = merged_original.index.astype(int)
+
+    merged_excluded = pd.concat([dataset_1.excluded, dataset_2.excluded], ignore_index=True)
+    if not merged_excluded.empty:
+        merged_excluded = merged_excluded.copy()
+        merged_excluded["source_row"] = merged_excluded["source_row"].astype(int)
+        merged_excluded.loc[len(dataset_1.excluded) :, "source_row"] += len(dataset_1.original)
+
+    merged_filtered = pd.concat([dataset_1.frame, dataset_2.frame], ignore_index=True)
+    merged_filtered = merged_filtered.copy()
+    merged_filtered["source_row"] = merged_filtered["source_row"].astype(int)
+    merged_filtered.loc[len(dataset_1.frame) :, "source_row"] += len(dataset_1.original)
+
+    merged_filtered_data = FilteredCustomData(
+        frame=merged_filtered,
+        excluded=merged_excluded,
+        original=merged_original,
+    )
+    exclusions_report = save_exclusions_report(merged_excluded, prepared_dir)
+    tables = build_custom_tables(merged_filtered)
+    prepared_paths = save_custom_tables(tables, prepared_dir)
+    relations_with_source = tables.DTI.copy()
+    relations_with_source["source_row"] = merged_filtered["source_row"].values
+    merged_name = Path(f"{args.dataset_1.stem}__{args.dataset_2.stem}{args.dataset_1.suffix}")
+    return (
+        {
+            "filtered": merged_filtered_data,
+            "tables": tables,
+            "prepared_paths": prepared_paths,
+            "exclusions_report": exclusions_report,
+            "relations_with_source": relations_with_source,
+        },
+        merged_name,
+    )
 
 
 def apply_runtime_overrides(cfg_dict: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -509,8 +575,13 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         args.best_param_name = default_best_param_name(args.split_strategy, args.balanced)
 
     base_config = resolve_base_config(args)
+    train_source = (
+        Path(f"{args.dataset_1.stem}__{args.dataset_2.stem}{args.dataset_1.suffix}")
+        if args.dataset_1 is not None
+        else args.train_data
+    )
     run_name = sanitize_slug(
-        f"{args.train_data.stem}_{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
+        f"{train_source.stem}_{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
     )
     run_root = args.artifacts_dir / run_name
     prepared_dir = run_root / "prepared_data"
@@ -521,12 +592,7 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     report_path = run_root / "metrics.json"
     train_log_path = logs_dir / "train.log"
 
-    prepared = prepare_custom_dataset(
-        args.train_data,
-        resolve_delimiter(args, "train"),
-        resolve_has_header(args, "train"),
-        prepared_dir,
-    )
+    prepared, train_export_path = prepare_training_dataset(args, prepared_dir)
 
     training_overrides = build_custom_training_overrides(args, run_root, checkpoint_dir)
     cfg = compose_cfg(base_config, training_overrides)
@@ -535,7 +601,7 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     cfg_dict = apply_runtime_overrides(cfg_dict, args)
 
     serializer_suffix = f"{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
-    drug_name, target_name = custom_serializer_names(args.train_data, serializer_suffix)
+    drug_name, target_name = custom_serializer_names(train_source, serializer_suffix)
     x_drug_embeddings, x_target_embeddings, embedding_paths = generate_custom_embeddings(
         cfg,
         prepared["tables"],
@@ -587,7 +653,7 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         prepared["filtered"],
         prediction_rows,
         export_dir,
-        args.train_data,
+        train_export_path,
         resolve_delimiter(args, "train"),
         split_assignments=split_map,
     )
@@ -601,7 +667,7 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         checkpoint_path,
         safetensors_path,
         metadata={
-            "custom_data": str(args.train_data.resolve()),
+            "custom_data": str(train_source),
             "base_config": base_config,
             "split_strategy": args.split_strategy,
             "source_checkpoint": str(checkpoint_path.resolve()),
@@ -613,7 +679,9 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     split_counts = {split_name: int(len(dataset_for_training[split_name])) for split_name in ("train", "val", "test")}
     report = {
         "mode": "custom_split_eval",
-        "train_data": str(args.train_data.resolve()),
+        "train_data": str(train_source),
+        "dataset_1": None if args.dataset_1 is None else str(args.dataset_1.resolve()),
+        "dataset_2": None if args.dataset_2 is None else str(args.dataset_2.resolve()),
         "base_config": base_config,
         "best_param_name": args.best_param_name,
         "split_strategy": args.split_strategy,
@@ -661,8 +729,13 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         args.best_param_name = default_best_param_name(args.split_strategy, args.balanced)
 
     base_config = resolve_base_config(args)
+    train_source = (
+        Path(f"{args.dataset_1.stem}__{args.dataset_2.stem}{args.dataset_1.suffix}")
+        if args.dataset_1 is not None
+        else args.train_data
+    )
     run_name = sanitize_slug(
-        f"{args.train_data.stem}_to_{args.test_data.stem}_{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
+        f"{train_source.stem}_to_{args.test_data.stem}_{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
     )
     run_root = args.artifacts_dir / run_name
     train_prepared_dir = run_root / "prepared_train_data"
@@ -674,12 +747,7 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     report_path = run_root / "metrics.json"
     train_log_path = logs_dir / "train.log"
 
-    train_prepared = prepare_custom_dataset(
-        args.train_data,
-        resolve_delimiter(args, "train"),
-        resolve_has_header(args, "train"),
-        train_prepared_dir,
-    )
+    train_prepared, train_export_path = prepare_training_dataset(args, train_prepared_dir)
     test_prepared = prepare_custom_dataset(
         args.test_data,
         resolve_delimiter(args, "test"),
@@ -694,7 +762,7 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     cfg_dict = apply_runtime_overrides(cfg_dict, args)
 
     train_serializer_suffix = f"train_{base_config}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
-    train_drug_name, train_target_name = custom_serializer_names(args.train_data, train_serializer_suffix)
+    train_drug_name, train_target_name = custom_serializer_names(train_source, train_serializer_suffix)
     train_x_drug_embeddings, train_x_target_embeddings, train_embedding_paths = generate_custom_embeddings(
         cfg,
         train_prepared["tables"],
@@ -757,7 +825,7 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         checkpoint_path,
         safetensors_path,
         metadata={
-            "train_data": str(args.train_data.resolve()),
+            "train_data": str(train_source),
             "test_data": str(args.test_data.resolve()),
             "base_config": base_config,
             "split_strategy": args.split_strategy,
@@ -772,7 +840,9 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     split_counts = {split_name: int(len(dataset_for_training[split_name])) for split_name in ("train", "val", "test")}
     report = {
         "mode": "custom_cross_eval",
-        "train_data": str(args.train_data.resolve()),
+        "train_data": str(train_source),
+        "dataset_1": None if args.dataset_1 is None else str(args.dataset_1.resolve()),
+        "dataset_2": None if args.dataset_2 is None else str(args.dataset_2.resolve()),
         "test_data": str(args.test_data.resolve()),
         "base_config": base_config,
         "best_param_name": args.best_param_name,
@@ -827,8 +897,13 @@ def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) ->
 
     args.split_strategy = normalize_split_strategy(args.split_strategy)
     source_checkpoint = args.finetune_checkpoint.resolve()
+    train_source = (
+        Path(f"{args.dataset_1.stem}__{args.dataset_2.stem}{args.dataset_1.suffix}")
+        if args.dataset_1 is not None
+        else args.train_data
+    )
     run_name = sanitize_slug(
-        f"finetune_{source_checkpoint.stem}_on_{args.train_data.stem}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
+        f"finetune_{source_checkpoint.stem}_on_{train_source.stem}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
     )
     run_root = args.artifacts_dir / run_name
     prepared_dir = run_root / "prepared_data"
@@ -839,17 +914,12 @@ def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) ->
     report_path = run_root / "metrics.json"
     train_log_path = logs_dir / "train.log"
 
-    prepared = prepare_custom_dataset(
-        args.train_data,
-        resolve_delimiter(args, "train"),
-        resolve_has_header(args, "train"),
-        prepared_dir,
-    )
+    prepared, train_export_path = prepare_training_dataset(args, prepared_dir)
 
     cfg, cfg_dict = build_finetuning_cfg(args, source_checkpoint, run_root, checkpoint_dir)
 
     serializer_suffix = f"finetune_{source_checkpoint.stem}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
-    drug_name, target_name = custom_serializer_names(args.train_data, serializer_suffix)
+    drug_name, target_name = custom_serializer_names(train_source, serializer_suffix)
     x_drug_embeddings, x_target_embeddings, embedding_paths = generate_custom_embeddings(
         cfg,
         prepared["tables"],
@@ -901,7 +971,7 @@ def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) ->
         prepared["filtered"],
         prediction_rows,
         export_dir,
-        args.train_data,
+        train_export_path,
         resolve_delimiter(args, "train"),
         split_assignments=split_map,
     )
@@ -915,7 +985,7 @@ def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) ->
         checkpoint_path,
         safetensors_path,
         metadata={
-            "finetune_data": str(args.train_data.resolve()),
+            "finetune_data": str(train_source),
             "source_checkpoint": str(source_checkpoint),
             "finetuned_checkpoint": str(checkpoint_path.resolve()),
             "split_strategy": args.split_strategy,
@@ -927,7 +997,9 @@ def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) ->
     split_counts = {split_name: int(len(dataset_for_training[split_name])) for split_name in ("train", "val", "test")}
     report = {
         "mode": "checkpoint_finetune",
-        "train_data": str(args.train_data.resolve()),
+        "train_data": str(train_source),
+        "dataset_1": None if args.dataset_1 is None else str(args.dataset_1.resolve()),
+        "dataset_2": None if args.dataset_2 is None else str(args.dataset_2.resolve()),
         "source_checkpoint": str(source_checkpoint),
         "checkpoint": str(checkpoint_path.resolve()),
         "split_strategy": args.split_strategy,
