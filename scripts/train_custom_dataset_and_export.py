@@ -198,10 +198,27 @@ def create_trainer(cfg_dict: dict[str, Any], tensorboard_root: Path):
     )
 
 
+def create_model(
+    cfg_dict: dict[str, Any],
+    dataset: dict[str, Any],
+    init_from_checkpoint: Path | None = None,
+):
+    import hydra
+
+    module_cfg = cfg_dict["module"]
+    if init_from_checkpoint is None:
+        return hydra.utils.instantiate(module_cfg, cfg_dict, dataset, _recursive_=False)
+
+    module_kwargs = {key: value for key, value in module_cfg.items() if key != "_target_"}
+    model_class = hydra.utils.get_class(module_cfg["_target_"])
+    return model_class.load_from_checkpoint(str(init_from_checkpoint), cfg=cfg_dict, dataset=dataset, **module_kwargs)
+
+
 def train_custom_model(
     cfg_dict: dict[str, Any],
     dataset: dict[str, Any],
     tensorboard_root: Path,
+    init_from_checkpoint: Path | None = None,
     resume_from_checkpoint: Path | None = None,
 ) -> None:
     import hydra
@@ -213,7 +230,7 @@ def train_custom_model(
     torch.backends.cudnn.benchmark = False
 
     data_module = hydra.utils.instantiate(cfg_dict["datamodule"], cfg_dict, dataset, _recursive_=False)
-    model = hydra.utils.instantiate(cfg_dict["module"], cfg_dict, dataset, _recursive_=False)
+    model = create_model(cfg_dict, dataset, init_from_checkpoint=init_from_checkpoint)
     trainer = create_trainer(cfg_dict, tensorboard_root)
     ckpt_path = None if resume_from_checkpoint is None else str(resume_from_checkpoint)
     trainer.fit(model, data_module, ckpt_path=ckpt_path)
@@ -228,6 +245,7 @@ def run_training_with_log(
     log_path: Path,
     argv: list[str] | None,
     command_name: str | None = None,
+    init_from_checkpoint: Path | None = None,
     resume_from_checkpoint: Path | None = None,
 ) -> None:
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,7 +257,13 @@ def run_training_with_log(
         handle.write("COMMAND: " + shlex.join(command) + "\n\n")
         handle.flush()
         with contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle):
-            train_custom_model(cfg_dict, dataset, tensorboard_root, resume_from_checkpoint=resume_from_checkpoint)
+            train_custom_model(
+                cfg_dict,
+                dataset,
+                tensorboard_root,
+                init_from_checkpoint=init_from_checkpoint,
+                resume_from_checkpoint=resume_from_checkpoint,
+            )
 
 
 def split_assignments(dataset: dict[str, Any]):

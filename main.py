@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import json
 import os
@@ -16,6 +17,7 @@ from scripts.common import (
     ensure_repo_on_path,
     get_experiment,
     load_checkpoint_cfg_dict,
+    normalize_dir,
     normalize_split_strategy,
     pick_checkpoint,
     run_command,
@@ -47,6 +49,12 @@ from scripts.train_existing_scenario_and_eval_custom import (
 )
 
 
+FINETUNE_DEFAULT_MAX_EPOCHS = 25
+FINETUNE_DEFAULT_LEARNING_RATE = 5e-5
+FINETUNE_DEFAULT_WEIGHT_DECAY = 0.0
+FINETUNE_DEFAULT_BATCH_SIZE = 128
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -73,6 +81,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint",
         type=Path,
         help="Existing .ckpt to evaluate on --test-data without training a new model.",
+    )
+    parser.add_argument(
+        "--finetune-checkpoint",
+        type=Path,
+        help="Existing .ckpt to finetune on --train-data before exporting predictions.",
     )
     parser.add_argument("--delimiter", default="|", help="Default delimiter for CSV custom datasets.")
     parser.add_argument("--has-header", action="store_true", help="Treat custom CSV input(s) as having a header row.")
@@ -178,6 +191,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="Resume custom training from a saved Lightning checkpoint.",
     )
     parser.add_argument(
+        "--finetune-max-epochs",
+        type=int,
+        default=FINETUNE_DEFAULT_MAX_EPOCHS,
+        help="Default epoch budget for finetuning runs when --max-epochs is not set.",
+    )
+    parser.add_argument(
+        "--finetune-learning-rate",
+        type=float,
+        default=FINETUNE_DEFAULT_LEARNING_RATE,
+        help="Default learning rate used by finetuning runs.",
+    )
+    parser.add_argument(
+        "--finetune-weight-decay",
+        type=float,
+        default=FINETUNE_DEFAULT_WEIGHT_DECAY,
+        help="Default weight decay used by finetuning runs.",
+    )
+    parser.add_argument(
+        "--finetune-batch-size",
+        type=int,
+        default=FINETUNE_DEFAULT_BATCH_SIZE,
+        help="Default dataloader batch size for finetuning runs when batch size is not otherwise overridden.",
+    )
+    parser.add_argument(
         "--drugbank-root",
         type=Path,
         default=REPO_ROOT / "datasets" / "drugbank",
@@ -210,6 +247,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_mode(args: argparse.Namespace) -> str:
+    if args.finetune_checkpoint is not None:
+        if args.checkpoint is not None:
+            raise ValueError("--finetune-checkpoint cannot be combined with --checkpoint.")
+        if args.scenario is not None or args.test_data is not None:
+            raise ValueError("--finetune-checkpoint cannot be combined with --scenario or --test-data.")
+        if args.train_data is None:
+            raise ValueError("--finetune-checkpoint mode requires --train-data.")
+        if args.resume_from_checkpoint is not None:
+            raise ValueError("--resume-from-checkpoint cannot be combined with --finetune-checkpoint.")
+        return "checkpoint_finetune"
+
     if args.checkpoint is not None:
         if args.scenario is not None or args.train_data is not None:
             raise ValueError("--checkpoint cannot be combined with --scenario or --train-data.")
@@ -231,7 +279,7 @@ def resolve_mode(args: argparse.Namespace) -> str:
     if args.train_data is not None:
         return "custom_cross_eval" if args.test_data is not None else "custom_split_eval"
 
-    raise ValueError("Provide one of --scenario, --train-data, or --checkpoint.")
+    raise ValueError("Provide one of --scenario, --train-data, --checkpoint, or --finetune-checkpoint.")
 
 
 def validate_ratios(args: argparse.Namespace) -> None:
@@ -307,6 +355,46 @@ def load_or_compose_checkpoint_cfg(args: argparse.Namespace, checkpoint_path: Pa
             )
         cfg = compose_cfg(args.base_config, checkpoint_fallback_overrides(args))
         cfg_dict = update_best_params(cfg)
+
+    cfg_dict = apply_runtime_overrides(cfg_dict, args)
+    cfg = OmegaConf.create(cfg_dict)
+    return cfg, cfg_dict
+
+
+def build_finetuning_cfg(args: argparse.Namespace, checkpoint_path: Path, run_root: Path, checkpoint_dir: Path) -> tuple[Any, dict[str, Any]]:
+    from omegaconf import OmegaConf
+
+    cfg_dict = load_checkpoint_cfg_dict(checkpoint_path)
+    if cfg_dict is None:
+        if args.base_config is None:
+            raise ValueError(
+                "The finetuning checkpoint does not contain a usable training config. Pass --base-config to supply one."
+            )
+        cfg = compose_cfg(args.base_config, build_custom_training_overrides(args, run_root, checkpoint_dir))
+        cfg_dict = update_best_params(cfg)
+    else:
+        cfg_dict = copy.deepcopy(cfg_dict)
+
+    cfg_dict["tuning"]["param_search"]["tune"] = False
+    cfg_dict["callbacks"]["model_checkpoint"]["dirpath"] = normalize_dir(checkpoint_dir)
+    cfg_dict["callbacks"]["model_checkpoint"]["save_top_k"] = 1
+    cfg_dict["callbacks"]["model_checkpoint"]["save_last"] = True
+    cfg_dict["callbacks"]["model_checkpoint"]["save_weights_only"] = False
+    cfg_dict["datamodule"]["serializer"]["save_path"] = normalize_dir(args.serialized_dir)
+    cfg_dict["logger"]["name"] = "finetune"
+    cfg_dict["multiprocessing"]["multiprocessing"] = False
+    cfg_dict["datamodule"]["splitting"]["splitting_strategy"] = normalize_split_strategy(args.split_strategy)
+    cfg_dict["datamodule"]["splitting"]["balanced"] = args.balanced
+    cfg_dict["datamodule"]["splitting"]["unbalanced_ratio"] = args.unbalanced_ratio
+    cfg_dict["datamodule"]["splitting"]["seed"] = args.seed
+    cfg_dict["datamodule"]["splitting"]["ratio"] = [args.train_ratio, args.val_ratio, args.test_ratio]
+    cfg_dict["trainer"]["max_epochs"] = args.max_epochs if args.max_epochs is not None else args.finetune_max_epochs
+    cfg_dict["module"]["optimizer"]["lr"] = args.finetune_learning_rate
+    cfg_dict["module"]["optimizer"]["weight_decay"] = args.finetune_weight_decay
+    if args.train_batch_size is None and args.eval_batch_size is None:
+        cfg_dict["datamodule"]["dm_cfg"]["batch_size"] = args.finetune_batch_size
+    if args.train_num_workers is not None:
+        cfg_dict["datamodule"]["dm_cfg"]["num_workers"] = args.train_num_workers
 
     cfg_dict = apply_runtime_overrides(cfg_dict, args)
     cfg = OmegaConf.create(cfg_dict)
@@ -734,6 +822,157 @@ def run_custom_cross_eval(args: argparse.Namespace, argv: list[str] | None) -> N
     )
 
 
+def run_checkpoint_finetune(args: argparse.Namespace, argv: list[str] | None) -> None:
+    from utils import utils
+
+    args.split_strategy = normalize_split_strategy(args.split_strategy)
+    source_checkpoint = args.finetune_checkpoint.resolve()
+    run_name = sanitize_slug(
+        f"finetune_{source_checkpoint.stem}_on_{args.train_data.stem}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
+    )
+    run_root = args.artifacts_dir / run_name
+    prepared_dir = run_root / "prepared_data"
+    logs_dir = run_root / "logs"
+    checkpoint_dir = run_root / "checkpoints"
+    export_dir = run_root / "exports"
+    tensorboard_root = run_root / "tensorboard"
+    report_path = run_root / "metrics.json"
+    train_log_path = logs_dir / "train.log"
+
+    prepared = prepare_custom_dataset(
+        args.train_data,
+        resolve_delimiter(args, "train"),
+        resolve_has_header(args, "train"),
+        prepared_dir,
+    )
+
+    cfg, cfg_dict = build_finetuning_cfg(args, source_checkpoint, run_root, checkpoint_dir)
+
+    serializer_suffix = f"finetune_{source_checkpoint.stem}_{args.split_strategy}_{'balanced' if args.balanced else 'unbalanced'}"
+    drug_name, target_name = custom_serializer_names(args.train_data, serializer_suffix)
+    x_drug_embeddings, x_target_embeddings, embedding_paths = generate_custom_embeddings(
+        cfg,
+        prepared["tables"],
+        args.serialized_dir,
+        drug_name,
+        target_name,
+        args.reuse_custom_embeddings,
+    )
+
+    dataset_for_training = utils.get_dataset(
+        cfg_dict,
+        x_drug_embeddings.copy(),
+        x_target_embeddings.copy(),
+        prepared["relations_with_source"][["Drug_ID", "Prot_ID", "label", "source_row"]].copy(),
+        ddi=None,
+        skipped=None,
+    )
+
+    split_table_path = save_split_table(dataset_for_training, prepared_dir / "split_table.tsv")
+    split_map = split_assignments(dataset_for_training)
+    used_rows = int(split_map.shape[0])
+
+    tensorboard_root.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("TENSORBOARD_LOG_DIR", str(tensorboard_root))
+
+    if not args.skip_training:
+        run_training_with_log(
+            cfg_dict,
+            dataset_for_training,
+            tensorboard_root,
+            train_log_path,
+            argv,
+            init_from_checkpoint=source_checkpoint,
+        )
+
+    checkpoint_path = pick_checkpoint(checkpoint_dir)
+    full_prediction_dataset = build_prediction_dataset(
+        x_drug_embeddings,
+        x_target_embeddings,
+        prepared["relations_with_source"][["Drug_ID", "Prot_ID", "label", "source_row"]],
+    )
+    prediction_rows = predict_checkpoint_on_dataset(
+        cfg_dict,
+        checkpoint_path,
+        full_prediction_dataset,
+        prepared["relations_with_source"]["source_row"].astype(int).tolist(),
+    )
+    prediction_exports = save_prediction_export(
+        prepared["filtered"],
+        prediction_rows,
+        export_dir,
+        args.train_data,
+        resolve_delimiter(args, "train"),
+        split_assignments=split_map,
+    )
+
+    test_source_rows = set(dataset_for_training["test"]["source_row"].astype(int).tolist())
+    test_predictions = prediction_rows[prediction_rows["source_row"].isin(test_source_rows)].reset_index(drop=True)
+    metrics, metric_notes = compute_metrics(test_predictions)
+
+    safetensors_path = export_dir / f"{checkpoint_path.stem}.safetensors"
+    export_checkpoint_to_safetensors(
+        checkpoint_path,
+        safetensors_path,
+        metadata={
+            "finetune_data": str(args.train_data.resolve()),
+            "source_checkpoint": str(source_checkpoint),
+            "finetuned_checkpoint": str(checkpoint_path.resolve()),
+            "split_strategy": args.split_strategy,
+        },
+    )
+
+    sample_count = int(len(prepared["tables"].DTI))
+    positive_count = int(prepared["tables"].DTI["label"].sum())
+    split_counts = {split_name: int(len(dataset_for_training[split_name])) for split_name in ("train", "val", "test")}
+    report = {
+        "mode": "checkpoint_finetune",
+        "train_data": str(args.train_data.resolve()),
+        "source_checkpoint": str(source_checkpoint),
+        "checkpoint": str(checkpoint_path.resolve()),
+        "split_strategy": args.split_strategy,
+        "balanced": args.balanced,
+        "seed": args.seed,
+        "samples": sample_count,
+        "excluded_rows": int(len(prepared["filtered"].excluded)),
+        "positives": positive_count,
+        "negatives": sample_count - positive_count,
+        "split_counts": split_counts,
+        "unused_rows": sample_count - used_rows,
+        "prepared_tables": {key: str(path.resolve()) for key, path in prepared["prepared_paths"].items()},
+        "split_table": str(split_table_path.resolve()),
+        "exclusions": None
+        if prepared["exclusions_report"] is None
+        else {key: str(path.resolve()) for key, path in prepared["exclusions_report"].items()},
+        "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
+        "prediction_exports": {key: str(path.resolve()) for key, path in prediction_exports.items()},
+        "logs": {"train": str(train_log_path.resolve())},
+        "safetensors": str(safetensors_path.resolve()),
+        "metrics": metrics,
+        "metric_notes": metric_notes,
+        "finetune_parameters": {
+            "max_epochs": cfg_dict["trainer"]["max_epochs"],
+            "learning_rate": cfg_dict["module"]["optimizer"]["lr"],
+            "weight_decay": cfg_dict["module"]["optimizer"]["weight_decay"],
+            "batch_size": cfg_dict["datamodule"]["dm_cfg"]["batch_size"],
+        },
+    }
+    write_report(report_path, report)
+
+    print(f"Training log: {train_log_path}")
+    print_common_summary(
+        prepared["prepared_paths"],
+        prepared["exclusions_report"],
+        prediction_exports,
+        checkpoint_path,
+        report_path,
+        metrics,
+        safetensors_path=safetensors_path,
+        split_table_path=split_table_path,
+        prefix="finetune",
+    )
+
+
 def run_scenario_eval(args: argparse.Namespace) -> None:
     from omegaconf import OmegaConf
 
@@ -928,7 +1167,7 @@ def main(argv: list[str] | None = None) -> None:
     args.serialized_dir.mkdir(parents=True, exist_ok=True)
 
     mode = resolve_mode(args)
-    if mode in {"custom_split_eval", "custom_cross_eval"}:
+    if mode in {"custom_split_eval", "custom_cross_eval", "checkpoint_finetune"}:
         validate_ratios(args)
 
     if mode == "custom_split_eval":
@@ -936,6 +1175,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if mode == "custom_cross_eval":
         run_custom_cross_eval(args, argv)
+        return
+    if mode == "checkpoint_finetune":
+        run_checkpoint_finetune(args, argv)
         return
     if mode == "scenario_eval":
         run_scenario_eval(args)
