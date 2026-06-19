@@ -9,8 +9,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 from scripts.common import (
     REPO_ROOT,
     RUN_PY,
@@ -34,7 +32,9 @@ from scripts.custom_dataset_utils import (
     export_checkpoint_to_safetensors,
     generate_custom_embeddings,
     predict_checkpoint_on_dataset,
+    read_inference_pairs,
     read_custom_triplets,
+    save_inference_export,
     save_custom_tables,
     save_exclusions_report,
     save_prediction_export,
@@ -68,7 +68,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("reproduce-paper",),
+        choices=("reproduce-paper", "infer"),
         help="Dedicated workflow command. Omit it to use the unified custom-data workflow.",
     )
     parser.add_argument("--scenario", help="Built-in scenario to train, in dataset:scenario_key form.")
@@ -81,6 +81,19 @@ def build_parser() -> argparse.ArgumentParser:
         dest="test_data",
         type=Path,
         help="Custom evaluation dataset path.",
+    )
+    parser.add_argument(
+        "--input-data",
+        "--inference-data",
+        dest="inference_data",
+        type=Path,
+        help="Inference-only table containing smiles and sequence columns.",
+    )
+    parser.add_argument(
+        "--output-csv",
+        type=Path,
+        default=None,
+        help="Optional exact CSV path for inference output.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -255,6 +268,17 @@ def resolve_mode(args: argparse.Namespace) -> str:
     if (args.dataset_1 is None) != (args.dataset_2 is None):
         raise ValueError("--dataset-1 and --dataset-2 must be provided together.")
 
+    if args.command == "infer":
+        if args.checkpoint is None:
+            raise ValueError("infer mode requires --checkpoint.")
+        if args.inference_data is None:
+            raise ValueError("infer mode requires --input-data.")
+        if args.scenario is not None or args.train_data is not None or args.test_data is not None:
+            raise ValueError("infer mode cannot be combined with --scenario, --train-data, or --test-data.")
+        if args.finetune_checkpoint is not None or args.resume_from_checkpoint is not None:
+            raise ValueError("infer mode cannot be combined with finetuning or resume flags.")
+        return "inference"
+
     if args.dataset_1 is not None:
         if args.train_data is not None:
             raise ValueError("--dataset-1/--dataset-2 cannot be combined with --train-data.")
@@ -330,6 +354,22 @@ def prepare_custom_dataset(path: Path, delimiter: str, has_header: bool, prepare
     }
 
 
+def prepare_inference_dataset(path: Path, delimiter: str, has_header: bool, prepared_dir: Path) -> dict[str, Any]:
+    filtered_data = read_inference_pairs(path, delimiter, has_header)
+    exclusions_report = save_exclusions_report(filtered_data.excluded, prepared_dir)
+    tables = build_custom_tables(filtered_data.frame)
+    prepared_paths = save_custom_tables(tables, prepared_dir)
+    relations_with_source = tables.DTI.copy()
+    relations_with_source["source_row"] = filtered_data.frame["source_row"].values
+    return {
+        "filtered": filtered_data,
+        "tables": tables,
+        "prepared_paths": prepared_paths,
+        "exclusions_report": exclusions_report,
+        "relations_with_source": relations_with_source,
+    }
+
+
 def prepare_training_dataset(args: argparse.Namespace, prepared_dir: Path) -> tuple[dict[str, Any], Path]:
     if args.dataset_1 is None:
         return (
@@ -341,6 +381,8 @@ def prepare_training_dataset(args: argparse.Namespace, prepared_dir: Path) -> tu
             ),
             args.train_data,
         )
+
+    import pandas as pd
 
     dataset_1 = read_custom_triplets(args.dataset_1, resolve_delimiter(args, "train"), resolve_has_header(args, "train"))
     dataset_2 = read_custom_triplets(args.dataset_2, resolve_delimiter(args, "train"), resolve_has_header(args, "train"))
@@ -565,6 +607,26 @@ def print_common_summary(
     print(f"Evaluation AUPRC: {format_metric(metrics['auprc'])}")
     print(f"Evaluation F1: {format_metric(metrics['f1'])}")
     print(f"Metrics report: {report_path}")
+
+
+def print_inference_summary(
+    prepared_paths: dict[str, Path],
+    exclusions_report: dict[str, Path] | None,
+    prediction_exports: dict[str, Path],
+    checkpoint_path: Path,
+    report_path: Path,
+) -> None:
+    print(f"Prepared inference drug table: {prepared_paths['drug_table']}")
+    print(f"Prepared inference protein table: {prepared_paths['protein_table']}")
+    print(f"Prepared inference relation table: {prepared_paths['relation_table']}")
+    if exclusions_report is not None:
+        print(f"Inference excluded rows report: {exclusions_report['rows']}")
+        print(f"Inference excluded rows summary: {exclusions_report['summary']}")
+    print(f"Inference export: {prediction_exports['csv']}")
+    if "json" in prediction_exports:
+        print(f"Inference export JSON: {prediction_exports['json']}")
+    print(f"Checkpoint: {checkpoint_path}")
+    print(f"Inference report: {report_path}")
 
 
 def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> None:
@@ -1222,6 +1284,67 @@ def run_checkpoint_eval(args: argparse.Namespace) -> None:
     )
 
 
+def run_inference(args: argparse.Namespace) -> None:
+    checkpoint_path = args.checkpoint.resolve()
+    input_path = args.inference_data.resolve()
+    run_name = sanitize_slug(f"infer_{input_path.stem}__{checkpoint_path.stem}")
+    run_root = args.artifacts_dir / run_name
+    prepared_dir = run_root / "prepared_data"
+    export_dir = run_root / "exports"
+    report_path = run_root / "inference_report.json"
+
+    prepared = prepare_inference_dataset(
+        input_path,
+        args.delimiter,
+        args.has_header,
+        prepared_dir,
+    )
+
+    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
+    prediction_rows, embedding_paths, _ = evaluate_relations(
+        cfg,
+        cfg_dict,
+        checkpoint_path,
+        args.serialized_dir,
+        input_path,
+        f"inference_{checkpoint_path.stem}",
+        prepared["tables"],
+        prepared["relations_with_source"],
+        args.reuse_custom_embeddings,
+    )
+    prediction_exports = save_inference_export(
+        prepared["filtered"],
+        prediction_rows,
+        export_dir,
+        input_path,
+        args.delimiter,
+        output_csv=args.output_csv,
+    )
+
+    report = {
+        "mode": "inference",
+        "checkpoint": str(checkpoint_path),
+        "input_data": str(input_path),
+        "samples": int(len(prepared["tables"].DTI)),
+        "excluded_rows": int(len(prepared["filtered"].excluded)),
+        "prepared_tables": {key: str(path.resolve()) for key, path in prepared["prepared_paths"].items()},
+        "exclusions": None
+        if prepared["exclusions_report"] is None
+        else {key: str(path.resolve()) for key, path in prepared["exclusions_report"].items()},
+        "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
+        "prediction_exports": {key: str(path.resolve()) for key, path in prediction_exports.items()},
+    }
+    write_report(report_path, report)
+
+    print_inference_summary(
+        prepared["prepared_paths"],
+        prepared["exclusions_report"],
+        prediction_exports,
+        checkpoint_path,
+        report_path,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -1256,6 +1379,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if mode == "checkpoint_eval":
         run_checkpoint_eval(args)
+        return
+    if mode == "inference":
+        run_inference(args)
         return
 
     raise RuntimeError(f"Unsupported workflow mode: {mode}")

@@ -123,6 +123,78 @@ def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> Filter
     return FilteredCustomData(frame=filtered, excluded=excluded, original=frame.copy())
 
 
+def read_inference_pairs(path: Path, delimiter: str, has_header: bool) -> FilteredCustomData:
+    import pandas as pd
+
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        frame = pd.read_csv(path, sep=delimiter, header=0 if has_header else None)
+    elif suffix == ".json":
+        frame = pd.read_json(path)
+    elif suffix == ".parquet":
+        frame = pd.read_parquet(path)
+    else:
+        raise ValueError("Inference input must be a .csv, .json, or .parquet file.")
+
+    if frame.empty:
+        raise ValueError(f"No data rows were found in {path}")
+
+    if suffix in {".json", ".parquet"} or has_header:
+        lowered = {str(column).strip().lower(): column for column in frame.columns}
+        expected_columns = {"smiles", "sequence"}
+        if not expected_columns.issubset(lowered):
+            raise ValueError("Inference input must contain columns named smiles and sequence.")
+        frame = frame.rename(columns={lowered["smiles"]: "SMILES", lowered["sequence"]: "SEQ"})
+        frame = frame[["SMILES", "SEQ"]]
+    else:
+        if frame.shape[1] != 2:
+            raise ValueError(f"Expected 2 columns in {path}, found {frame.shape[1]}")
+        frame = frame.iloc[:, :2]
+        frame.columns = ["SMILES", "SEQ"]
+
+    frame["SMILES"] = frame["SMILES"].astype(str).str.strip()
+    frame["SEQ"] = frame["SEQ"].astype(str).str.strip()
+    frame = frame.reset_index(drop=True)
+    frame.insert(0, "source_row", frame.index.astype(int))
+    frame["label"] = 0
+
+    invalid_sequences = ~frame["SEQ"].str.fullmatch(r"[ACDEFGHIKLMNPQRSTVWY]+")
+    too_long_smiles = frame["SMILES"].str.len() > 510
+    too_long_sequences = frame["SEQ"].str.len() > 700
+    empty_smiles = frame["SMILES"].eq("")
+    empty_sequences = frame["SEQ"].eq("")
+
+    exclusion_reason = pd.Series("", index=frame.index, dtype="object")
+    exclusion_reason = exclusion_reason.mask(empty_smiles, exclusion_reason.where(~empty_smiles, "empty_smiles"))
+    exclusion_reason = exclusion_reason.mask(
+        empty_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(empty_sequences & exclusion_reason.eq("")), "empty_sequence"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        invalid_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(invalid_sequences & exclusion_reason.eq("")), "non_canonical_sequence"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        too_long_smiles & exclusion_reason.eq(""),
+        exclusion_reason.where(~(too_long_smiles & exclusion_reason.eq("")), "smiles_too_long"),
+    )
+    exclusion_reason = exclusion_reason.mask(
+        too_long_sequences & exclusion_reason.eq(""),
+        exclusion_reason.where(~(too_long_sequences & exclusion_reason.eq("")), "sequence_too_long"),
+    )
+
+    excluded_mask = exclusion_reason.ne("")
+    excluded = frame.loc[excluded_mask].copy()
+    if not excluded.empty:
+        excluded.insert(1, "reason", exclusion_reason.loc[excluded_mask].values)
+
+    filtered = frame.loc[~excluded_mask].copy()
+    if filtered.empty:
+        raise ValueError("All inference rows were filtered out. Check the exclusions report for details.")
+
+    return FilteredCustomData(frame=filtered, excluded=excluded, original=frame.copy())
+
+
 def save_exclusions_report(excluded: Any, output_dir: Path) -> dict[str, Path] | None:
     if excluded.empty:
         return None
@@ -295,6 +367,49 @@ def save_prediction_export(
     outputs = {"csv": csv_path}
     if input_path.suffix.lower() in {".json", ".parquet"}:
         json_path = output_dir / "predictions_with_scores.json"
+        json_path.write_text(export_frame.to_json(orient="records", indent=2), encoding="utf-8")
+        outputs["json"] = json_path
+
+    return outputs
+
+
+def save_inference_export(
+    filtered_custom_data: FilteredCustomData,
+    prediction_rows: Any,
+    output_dir: Path,
+    input_path: Path,
+    delimiter: str,
+    output_csv: Path | None = None,
+) -> dict[str, Path]:
+    import numpy as np
+    import pandas as pd
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    export_frame = filtered_custom_data.original.copy()
+    export_frame = export_frame.rename(columns={"SMILES": "smiles", "SEQ": "sequence"})
+    export_frame["label"] = pd.Series([pd.NA] * len(export_frame), dtype="Int64")
+    export_frame["probability"] = np.nan
+
+    prediction_indexed = prediction_rows.set_index("source_row")
+    prediction_mask = export_frame["source_row"].isin(prediction_indexed.index)
+    export_frame.loc[prediction_mask, "label"] = export_frame.loc[prediction_mask, "source_row"].map(
+        prediction_indexed["predicted_label"]
+    )
+    export_frame.loc[prediction_mask, "probability"] = export_frame.loc[prediction_mask, "source_row"].map(
+        prediction_indexed["probability_active"]
+    )
+
+    export_frame = export_frame.drop(columns=["source_row"])
+    export_frame = export_frame[["smiles", "sequence", "label", "probability"]]
+
+    csv_path = output_dir / "inference_predictions.csv" if output_csv is None else output_csv
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    export_frame.to_csv(csv_path, sep=delimiter, index=False)
+
+    outputs = {"csv": csv_path}
+    if input_path.suffix.lower() in {".json", ".parquet"}:
+        json_path = output_dir / "inference_predictions.json"
         json_path.write_text(export_frame.to_json(orient="records", indent=2), encoding="utf-8")
         outputs["json"] = json_path
 

@@ -300,6 +300,39 @@ python main.py reproduce-paper --datasets drugbank bindingDB
 
 `reproduce-paper` now also includes the built-in `balanced_cold_full` and `unbalanced_cold_full` scenarios for DrugBank and BindingDB. Those runs currently reuse the closest existing cold-start best-parameter files because the repo does not yet have dedicated tuned `cold_full` parameter YAMLs.
 
+### 5. Run inference only from a checkpoint
+
+Inference inputs contain two fields:
+
+```text
+smiles|sequence
+```
+
+Example with a header row:
+
+```text
+smiles|sequence
+CCO|MTEITAAMVKELRESTGAGMMDCKNALSETQHEWAY
+```
+
+Run inference without training:
+
+```bash
+python main.py infer \
+  --checkpoint path/to/model.ckpt \
+  --input-data path/to/inference.csv \
+  --has-header \
+  --output-csv artifacts/inference_predictions.csv
+```
+
+The CSV output contains:
+
+```text
+smiles|sequence|label|probability
+```
+
+When `--output-csv` is omitted, the file is written under `artifacts/custom_workflow/infer_*/exports/inference_predictions.csv`.
+
 ---
 
 ## Integration of a Custom Featurizer
