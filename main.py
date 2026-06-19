@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -519,6 +520,8 @@ def evaluate_relations(
     tables: Any,
     relations_with_source: Any,
     reuse_custom_embeddings: bool,
+    progress_desc: str = "Predicting",
+    log_fn: Any | None = None,
 ) -> tuple[Any, dict[str, Path], Any]:
     drug_name, target_name = custom_serializer_names(dataset_path, serializer_suffix)
     x_drug_embeddings, x_target_embeddings, embedding_paths = generate_custom_embeddings(
@@ -539,6 +542,8 @@ def evaluate_relations(
         checkpoint_path,
         prediction_dataset,
         relations_with_source["source_row"].astype(int).tolist(),
+        progress_desc=progress_desc,
+        log_fn=log_fn,
     )
     return prediction_rows, embedding_paths, prediction_dataset
 
@@ -571,6 +576,15 @@ def compute_metrics(prediction_rows: Any) -> tuple[dict[str, float | None], list
 def write_report(report_path: Path, report: dict[str, Any]) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def append_log(log_path: Path, message: str) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().isoformat(timespec="seconds")
+    line = f"[{timestamp}] {message}"
+    print(line)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
 
 
 def format_metric(value: float | None) -> str:
@@ -615,6 +629,7 @@ def print_inference_summary(
     prediction_exports: dict[str, Path],
     checkpoint_path: Path,
     report_path: Path,
+    log_path: Path,
 ) -> None:
     print(f"Prepared inference drug table: {prepared_paths['drug_table']}")
     print(f"Prepared inference protein table: {prepared_paths['protein_table']}")
@@ -625,6 +640,7 @@ def print_inference_summary(
     print(f"Inference export: {prediction_exports['csv']}")
     if "json" in prediction_exports:
         print(f"Inference export JSON: {prediction_exports['json']}")
+    print(f"Inference log: {log_path}")
     print(f"Checkpoint: {checkpoint_path}")
     print(f"Inference report: {report_path}")
 
@@ -1290,17 +1306,33 @@ def run_inference(args: argparse.Namespace) -> None:
     run_name = sanitize_slug(f"infer_{input_path.stem}__{checkpoint_path.stem}")
     run_root = args.artifacts_dir / run_name
     prepared_dir = run_root / "prepared_data"
+    logs_dir = run_root / "logs"
     export_dir = run_root / "exports"
+    log_path = logs_dir / "inference.log"
     report_path = run_root / "inference_report.json"
+    if log_path.exists():
+        log_path.unlink()
 
+    append_log(log_path, "Starting inference")
+    append_log(log_path, f"Input data: {input_path}")
+    append_log(log_path, f"Checkpoint: {checkpoint_path}")
+
+    append_log(log_path, "Reading and validating inference table")
     prepared = prepare_inference_dataset(
         input_path,
         args.delimiter,
         args.has_header,
         prepared_dir,
     )
+    append_log(
+        log_path,
+        f"Prepared {len(prepared['filtered'].frame)} rows "
+        f"({len(prepared['filtered'].excluded)} excluded)",
+    )
 
+    append_log(log_path, "Loading checkpoint configuration")
     cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
+    append_log(log_path, "Generating or loading embeddings")
     prediction_rows, embedding_paths, _ = evaluate_relations(
         cfg,
         cfg_dict,
@@ -1311,7 +1343,10 @@ def run_inference(args: argparse.Namespace) -> None:
         prepared["tables"],
         prepared["relations_with_source"],
         args.reuse_custom_embeddings,
+        progress_desc="Inference",
+        log_fn=lambda message: append_log(log_path, message),
     )
+    append_log(log_path, "Writing inference export")
     prediction_exports = save_inference_export(
         prepared["filtered"],
         prediction_rows,
@@ -1333,8 +1368,12 @@ def run_inference(args: argparse.Namespace) -> None:
         else {key: str(path.resolve()) for key, path in prepared["exclusions_report"].items()},
         "custom_embeddings": {key: str(path.resolve()) for key, path in embedding_paths.items()},
         "prediction_exports": {key: str(path.resolve()) for key, path in prediction_exports.items()},
+        "logs": {"inference": str(log_path.resolve())},
     }
     write_report(report_path, report)
+    append_log(log_path, f"Inference export: {prediction_exports['csv']}")
+    append_log(log_path, f"Inference report: {report_path}")
+    append_log(log_path, "Inference complete")
 
     print_inference_summary(
         prepared["prepared_paths"],
@@ -1342,6 +1381,7 @@ def run_inference(args: argparse.Namespace) -> None:
         prediction_exports,
         checkpoint_path,
         report_path,
+        log_path,
     )
 
 

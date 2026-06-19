@@ -333,6 +333,8 @@ smiles|sequence|label|probability
 
 When `--output-csv` is omitted, the file is written under `artifacts/custom_workflow/infer_*/exports/inference_predictions.csv`.
 
+Inference also writes `logs/inference.log` under the same run directory and shows a `tqdm` progress bar while checkpoint batches are being scored.
+
 ---
 
 ## Integration of a Custom Featurizer

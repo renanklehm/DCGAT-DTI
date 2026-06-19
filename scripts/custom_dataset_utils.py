@@ -436,6 +436,8 @@ def predict_checkpoint_on_dataset(
     checkpoint_path: Path,
     dataset: dict[str, pd.DataFrame],
     source_rows: list[int],
+    progress_desc: str = "Predicting",
+    log_fn: Any | None = None,
 ) -> pd.DataFrame:
     import pandas as pd
     import torch
@@ -443,6 +445,8 @@ def predict_checkpoint_on_dataset(
     from datamodule.dataloader_GAT import MyDataset
     from module.cognn_cross import Net
 
+    if log_fn is not None:
+        log_fn(f"Loading checkpoint: {checkpoint_path}")
     model = Net.load_from_checkpoint(
         str(checkpoint_path),
         cfg=cfg_dict,
@@ -456,6 +460,8 @@ def predict_checkpoint_on_dataset(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
+    if log_fn is not None:
+        log_fn(f"Using device: {device}")
 
     test_table = dataset["test"].reset_index(drop=True)
     prediction_dataset = MyDataset(dataset["X_drug"], dataset["X_target"], test_table)
@@ -465,12 +471,26 @@ def predict_checkpoint_on_dataset(
         shuffle=False,
         num_workers=0,
     )
+    if log_fn is not None:
+        log_fn(
+            f"Scoring {len(prediction_dataset)} rows in {len(dataloader)} batches "
+            f"(batch_size={cfg_dict['datamodule']['dm_cfg']['batch_size']})"
+        )
 
     probabilities: list[float] = []
     true_labels: list[int] = []
 
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        tqdm = None
+
+    batches = dataloader
+    if tqdm is not None:
+        batches = tqdm(dataloader, desc=progress_desc, unit="batch")
+
     with torch.no_grad():
-        for batch in dataloader:
+        for batch in batches:
             x1, x2, y, drugs, targets = batch
             x1 = x1.to(device)
             x2 = x2.to(device)
@@ -502,6 +522,9 @@ def predict_checkpoint_on_dataset(
             batch_probabilities = torch.sigmoid(logits).detach().cpu().numpy().tolist()
             probabilities.extend(batch_probabilities)
             true_labels.extend(y.detach().cpu().numpy().astype(int).tolist())
+
+    if log_fn is not None:
+        log_fn(f"Finished scoring {len(probabilities)} rows")
 
     predicted_labels = [1 if probability >= 0.5 else 0 for probability in probabilities]
     probability_inactive = [1.0 - probability for probability in probabilities]
