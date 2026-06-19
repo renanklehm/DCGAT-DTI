@@ -11,6 +11,7 @@ from scripts.common import relax_transformers_torch_load_guard, sanitize_slug
 
 
 PROGRESS_CHUNK_ROWS = 250_000
+INFERENCE_PREPARATION_CACHE_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,178 @@ class FilteredCustomData:
     frame: Any
     excluded: Any
     original: Any
+
+
+def _inference_source_signature(path: Path, delimiter: str, has_header: bool) -> dict[str, Any]:
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "delimiter": delimiter,
+        "has_header": has_header,
+    }
+
+
+def save_inference_preparation_manifest(
+    prepared: dict[str, Any],
+    input_path: Path,
+    delimiter: str,
+    has_header: bool,
+    prepared_dir: Path,
+) -> Path:
+    manifest_path = prepared_dir / "inference_preparation_manifest.json"
+    tracked_paths = dict(prepared["prepared_paths"])
+    if prepared["exclusions_report"] is not None:
+        tracked_paths.update({f"exclusions_{key}": value for key, value in prepared["exclusions_report"].items()})
+    manifest = {
+        "version": INFERENCE_PREPARATION_CACHE_VERSION,
+        "source": _inference_source_signature(input_path, delimiter, has_header),
+        "rows": {
+            "kept": int(len(prepared["filtered"].frame)),
+            "excluded": int(len(prepared["filtered"].excluded)),
+        },
+        "files": {key: {"name": path.name, "size": path.stat().st_size} for key, path in tracked_paths.items()},
+    }
+    prepared_dir.mkdir(parents=True, exist_ok=True)
+    temporary_path = manifest_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    temporary_path.replace(manifest_path)
+    return manifest_path
+
+
+def load_cached_inference_preparation(
+    input_path: Path,
+    delimiter: str,
+    has_header: bool,
+    prepared_dir: Path,
+    log_fn: Any | None = None,
+) -> dict[str, Any] | None:
+    """Load completed inference TSVs, including caches made before manifests existed."""
+    import numpy as np
+    import pandas as pd
+
+    drug_path = prepared_dir / "drug_table.tsv"
+    protein_path = prepared_dir / "protein_table.tsv"
+    relation_path = prepared_dir / "relation_table.tsv"
+    excluded_path = prepared_dir / "excluded_rows.tsv"
+    summary_path = prepared_dir / "excluded_summary.json"
+    manifest_path = prepared_dir / "inference_preparation_manifest.json"
+    required_table_paths = (drug_path, protein_path, relation_path)
+
+    if not all(path.is_file() for path in required_table_paths):
+        return None
+
+    manifest = None
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("version") != INFERENCE_PREPARATION_CACHE_VERSION:
+                _emit(log_fn, "Prepared inference cache version changed; rebuilding")
+                return None
+            if manifest.get("source") != _inference_source_signature(input_path, delimiter, has_header):
+                _emit(log_fn, "Prepared inference cache does not match the current input; rebuilding")
+                return None
+            for file_info in manifest.get("files", {}).values():
+                cached_path = prepared_dir / file_info["name"]
+                if not cached_path.is_file() or cached_path.stat().st_size != file_info["size"]:
+                    _emit(log_fn, f"Prepared inference cache file is missing or incomplete: {cached_path}; rebuilding")
+                    return None
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            _emit(log_fn, f"Prepared inference cache manifest is invalid ({exc}); rebuilding")
+            return None
+    elif input_path.suffix.lower() != ".parquet" or not (excluded_path.is_file() and summary_path.is_file()):
+        # A pre-manifest cache can only prove completeness when its exclusions outputs exist too.
+        return None
+
+    cache_kind = "validated" if manifest is not None else "legacy"
+    _emit(log_fn, f"Reusing {cache_kind} prepared inference TSVs from {prepared_dir}")
+    try:
+        with _timed_step(log_fn, "Loading prepared inference TSVs"):
+            drug_table = pd.read_csv(drug_path, sep="\t", dtype=str)
+            protein_table = pd.read_csv(protein_path, sep="\t", dtype=str)
+            relation_table = pd.read_csv(
+                relation_path,
+                sep="\t",
+                dtype={"Drug_ID": str, "Prot_ID": str, "label": int},
+            )
+            if excluded_path.is_file():
+                excluded = pd.read_csv(excluded_path, sep="\t")
+            else:
+                excluded = pd.DataFrame(columns=["source_row", "reason", "SMILES", "SEQ", "label"])
+
+        expected_columns = (
+            {"drug_id", "SMILES"},
+            {"protein_id", "SEQ"},
+            {"Drug_ID", "Prot_ID", "label"},
+        )
+        actual_columns = (set(drug_table.columns), set(protein_table.columns), set(relation_table.columns))
+        if actual_columns != expected_columns:
+            raise ValueError("prepared table columns do not match the inference cache schema")
+
+        kept_count = len(relation_table)
+        excluded_count = len(excluded)
+        if manifest is not None and manifest.get("rows") != {"kept": kept_count, "excluded": excluded_count}:
+            raise ValueError("prepared table row counts do not match the manifest")
+        if manifest is None:
+            import pyarrow.parquet as pq
+
+            source_row_count = pq.ParquetFile(input_path).metadata.num_rows
+            if source_row_count != kept_count + excluded_count:
+                raise ValueError("legacy prepared table row counts do not match the Parquet input")
+
+        excluded["source_row"] = excluded["source_row"].astype(int)
+        total_count = kept_count + excluded_count
+        excluded_source_rows = excluded["source_row"].to_numpy(dtype=np.int64, copy=False)
+        if excluded_count and ((excluded_source_rows < 0).any() or (excluded_source_rows >= total_count).any()):
+            raise ValueError("excluded source rows are not a valid subset of the original input")
+        excluded_mask = np.zeros(total_count, dtype=bool)
+        excluded_mask[excluded_source_rows] = True
+        if int(excluded_mask.sum()) != excluded_count:
+            raise ValueError("excluded source rows contain duplicates")
+        kept_source_rows = np.flatnonzero(~excluded_mask)
+        if kept_source_rows.size != kept_count:
+            raise ValueError("could not reconstruct kept source rows")
+
+        drug_lookup = drug_table.set_index("drug_id")["SMILES"]
+        protein_lookup = protein_table.set_index("protein_id")["SEQ"]
+        kept = pd.DataFrame(
+            {
+                "source_row": kept_source_rows,
+                "SMILES": relation_table["Drug_ID"].map(drug_lookup),
+                "SEQ": relation_table["Prot_ID"].map(protein_lookup),
+                "label": relation_table["label"].astype(int),
+            }
+        )
+        if kept[["SMILES", "SEQ"]].isna().any().any():
+            raise ValueError("relation table references unknown drug or protein IDs")
+
+        excluded["label"] = excluded["label"].astype(int)
+        original = pd.concat(
+            [kept, excluded[["source_row", "SMILES", "SEQ", "label"]]],
+            ignore_index=True,
+        ).sort_values("source_row", ignore_index=True)
+        tables = CustomDatasetTables(
+            X_drug=drug_table.set_index("drug_id"),
+            X_target=protein_table.set_index("protein_id"),
+            DTI=relation_table,
+        )
+        relations_with_source = relation_table.copy()
+        relations_with_source["source_row"] = kept_source_rows
+        prepared_paths = {"drug_table": drug_path, "protein_table": protein_path, "relation_table": relation_path}
+        exclusions_report = None
+        if excluded_count:
+            exclusions_report = {"rows": excluded_path, "summary": summary_path}
+        return {
+            "filtered": FilteredCustomData(frame=kept, excluded=excluded, original=original),
+            "tables": tables,
+            "prepared_paths": prepared_paths,
+            "exclusions_report": exclusions_report,
+            "relations_with_source": relations_with_source,
+        }
+    except (ImportError, KeyError, OSError, TypeError, ValueError) as exc:
+        _emit(log_fn, f"Prepared inference TSV cache is invalid ({exc}); rebuilding")
+        return None
 
 
 def _emit(log_fn: Any | None, message: str) -> None:
@@ -373,6 +546,20 @@ def custom_serializer_names(custom_data_path: Path, suffix: str) -> tuple[str, s
         f"custom_{stem}_{suffix_slug}_PubChem10M.pt",
         f"custom_{stem}_{suffix_slug}_ESM.pt",
     )
+
+
+def ensure_prediction_runtime() -> None:
+    """Fail before featurization when the Lightning runtime is incomplete."""
+    try:
+        import pytorch_lightning  # noqa: F401
+    except ModuleNotFoundError as exc:
+        if exc.name == "pkg_resources":
+            raise RuntimeError(
+                "The installed Lightning runtime requires pkg_resources. "
+                "Install setuptools=68.0.0 or recreate the environment from "
+                "environment.runpod.yaml before running prediction."
+            ) from exc
+        raise
 
 
 def generate_custom_embeddings(

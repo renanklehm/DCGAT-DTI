@@ -325,6 +325,10 @@ python main.py infer \
   --output-csv artifacts/inference_predictions.csv
 ```
 
+If a run stops after saving the drug and protein embeddings, rerun the same command with
+`--reuse-custom-embeddings`. Keep the same working directory or pass the same `--serialized-dir`
+so inference loads the saved `.pt` files instead of regenerating them.
+
 The CSV output contains:
 
 ```text

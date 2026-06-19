@@ -9,6 +9,7 @@ channels:
 dependencies:
   - python=3.10
   - pip
+  - setuptools=68.0.0
   - pytorch=2.1.1
   - torchvision=0.16.1
   - torchaudio=2.1.1
@@ -28,9 +29,10 @@ dependencies:
   - transformers=4.32.1
   - tokenizers=0.13.3
   - huggingface_hub=0.19.4
-  - lightning=2.1.2
-  - pytorch-lightning=2.1.1
+  - lightning=2.6.5
+  - pytorch-lightning=2.6.5
   - torchmetrics=1.2.1
+  - hf_transfer=0.1.9
   - pip:
       - antlr4-python3-runtime==4.9.3
       - fair-esm==2.0.0

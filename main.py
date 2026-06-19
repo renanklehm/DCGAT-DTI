@@ -30,12 +30,15 @@ from scripts.custom_dataset_utils import (
     build_custom_tables,
     build_prediction_dataset,
     custom_serializer_names,
+    ensure_prediction_runtime,
     export_checkpoint_to_safetensors,
     generate_custom_embeddings,
+    load_cached_inference_preparation,
     predict_checkpoint_on_dataset,
     read_inference_pairs,
     read_custom_triplets,
     save_inference_export,
+    save_inference_preparation_manifest,
     save_custom_tables,
     save_exclusions_report,
     save_prediction_export,
@@ -362,6 +365,12 @@ def prepare_inference_dataset(
     prepared_dir: Path,
     log_fn: Any | None = None,
 ) -> dict[str, Any]:
+    cached = load_cached_inference_preparation(path, delimiter, has_header, prepared_dir, log_fn=log_fn)
+    if cached is not None:
+        # This also upgrades complete pre-manifest TSVs so later retries can validate the input identity.
+        save_inference_preparation_manifest(cached, path, delimiter, has_header, prepared_dir)
+        return cached
+
     filtered_data = read_inference_pairs(path, delimiter, has_header, log_fn=log_fn)
     exclusions_report = save_exclusions_report(filtered_data.excluded, prepared_dir, log_fn=log_fn)
     tables = build_custom_tables(filtered_data.frame, log_fn=log_fn)
@@ -369,13 +378,15 @@ def prepare_inference_dataset(
     with timed_log_step(log_fn, "Adding source rows to prepared inference relations"):
         relations_with_source = tables.DTI.copy()
         relations_with_source["source_row"] = filtered_data.frame["source_row"].values
-    return {
+    prepared = {
         "filtered": filtered_data,
         "tables": tables,
         "prepared_paths": prepared_paths,
         "exclusions_report": exclusions_report,
         "relations_with_source": relations_with_source,
     }
+    save_inference_preparation_manifest(prepared, path, delimiter, has_header, prepared_dir)
+    return prepared
 
 
 def prepare_training_dataset(args: argparse.Namespace, prepared_dir: Path) -> tuple[dict[str, Any], Path]:
@@ -530,6 +541,7 @@ def evaluate_relations(
     progress_desc: str = "Predicting",
     log_fn: Any | None = None,
 ) -> tuple[Any, dict[str, Path], Any]:
+    ensure_prediction_runtime()
     drug_name, target_name = custom_serializer_names(dataset_path, serializer_suffix)
     x_drug_embeddings, x_target_embeddings, embedding_paths = generate_custom_embeddings(
         cfg,
@@ -1345,6 +1357,10 @@ def run_inference(args: argparse.Namespace) -> None:
     append_log(log_path, f"Input data: {input_path}")
     append_log(log_path, f"Checkpoint: {checkpoint_path}")
 
+    append_log(log_path, "Preflighting inference runtime and checkpoint configuration")
+    ensure_prediction_runtime()
+    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
+
     append_log(log_path, "Reading and validating inference table")
     prepared = prepare_inference_dataset(
         input_path,
@@ -1359,8 +1375,6 @@ def run_inference(args: argparse.Namespace) -> None:
         f"({len(prepared['filtered'].excluded)} excluded)",
     )
 
-    append_log(log_path, "Loading checkpoint configuration")
-    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
     append_log(log_path, "Generating or loading embeddings")
     prediction_rows, embedding_paths, _ = evaluate_relations(
         cfg,
