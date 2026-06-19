@@ -333,7 +333,7 @@ smiles|sequence|label|probability
 
 When `--output-csv` is omitted, the file is written under `artifacts/custom_workflow/infer_*/exports/inference_predictions.csv`.
 
-Inference also writes `logs/inference.log` under the same run directory and shows a `tqdm` progress bar while checkpoint batches are being scored.
+Inference also writes `logs/inference.log` under the same run directory. Large inference runs log timed stages for input loading, validation, table preparation, embedding reuse/generation, scoring, and export, with `tqdm` progress bars for chunked validation/write steps and checkpoint batches. When `--output-csv` is provided for JSON or Parquet input, inference writes only that CSV path and skips the default JSON sidecar.
 
 ---
 

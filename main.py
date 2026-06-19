@@ -355,13 +355,20 @@ def prepare_custom_dataset(path: Path, delimiter: str, has_header: bool, prepare
     }
 
 
-def prepare_inference_dataset(path: Path, delimiter: str, has_header: bool, prepared_dir: Path) -> dict[str, Any]:
-    filtered_data = read_inference_pairs(path, delimiter, has_header)
-    exclusions_report = save_exclusions_report(filtered_data.excluded, prepared_dir)
-    tables = build_custom_tables(filtered_data.frame)
-    prepared_paths = save_custom_tables(tables, prepared_dir)
-    relations_with_source = tables.DTI.copy()
-    relations_with_source["source_row"] = filtered_data.frame["source_row"].values
+def prepare_inference_dataset(
+    path: Path,
+    delimiter: str,
+    has_header: bool,
+    prepared_dir: Path,
+    log_fn: Any | None = None,
+) -> dict[str, Any]:
+    filtered_data = read_inference_pairs(path, delimiter, has_header, log_fn=log_fn)
+    exclusions_report = save_exclusions_report(filtered_data.excluded, prepared_dir, log_fn=log_fn)
+    tables = build_custom_tables(filtered_data.frame, log_fn=log_fn)
+    prepared_paths = save_custom_tables(tables, prepared_dir, log_fn=log_fn)
+    with timed_log_step(log_fn, "Adding source rows to prepared inference relations"):
+        relations_with_source = tables.DTI.copy()
+        relations_with_source["source_row"] = filtered_data.frame["source_row"].values
     return {
         "filtered": filtered_data,
         "tables": tables,
@@ -531,6 +538,7 @@ def evaluate_relations(
         drug_name,
         target_name,
         reuse_custom_embeddings,
+        log_fn=log_fn,
     )
     prediction_dataset = build_prediction_dataset(
         x_drug_embeddings,
@@ -585,6 +593,26 @@ def append_log(log_path: Path, message: str) -> None:
     print(line)
     with log_path.open("a", encoding="utf-8") as handle:
         handle.write(line + "\n")
+
+
+class timed_log_step:
+    def __init__(self, log_fn: Any | None, message: str) -> None:
+        self.log_fn = log_fn
+        self.message = message
+        self.start = 0.0
+
+    def __enter__(self) -> None:
+        import time
+
+        self.start = time.perf_counter()
+        if self.log_fn is not None:
+            self.log_fn(f"{self.message}...")
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        import time
+
+        if self.log_fn is not None:
+            self.log_fn(f"{self.message} done in {time.perf_counter() - self.start:.1f}s")
 
 
 def format_metric(value: float | None) -> str:
@@ -1323,6 +1351,7 @@ def run_inference(args: argparse.Namespace) -> None:
         args.delimiter,
         args.has_header,
         prepared_dir,
+        log_fn=lambda message: append_log(log_path, message),
     )
     append_log(
         log_path,
@@ -1354,6 +1383,7 @@ def run_inference(args: argparse.Namespace) -> None:
         input_path,
         args.delimiter,
         output_csv=args.output_csv,
+        log_fn=lambda message: append_log(log_path, message),
     )
 
     report = {
