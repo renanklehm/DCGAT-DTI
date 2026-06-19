@@ -328,19 +328,19 @@ class LogitGCN(nn.Module):
 
 class Cross_GAT(nn.Module):
 
-    def __init__(self):
+    def __init__(self, drug_dim, prot_dim):
 
         super(Cross_GAT, self).__init__()
-        self.drug_layers = nn.ModuleList([GATConv(in_channels_first=-1, in_channels_second=1280, out_channels=96, heads=8, dropout=0.3, add_self_loops=False)])
+        self.drug_layers = nn.ModuleList([GATConv(in_channels_first=drug_dim, in_channels_second=prot_dim, out_channels=96, heads=8, dropout=0.3, add_self_loops=False)])
         self.num_layers = 2 # set as per the need
         for i in range(self.num_layers):
-            self.drug_layers.append(GATConv(in_channels_first=96 * 8, in_channels_second=1280, out_channels=96, heads=8, dropout=0.3, add_self_loops=False))
-        self.prot_layers = nn.ModuleList([GATConv(in_channels_first=-1, in_channels_second=768, out_channels=160, heads=8, dropout=0.2, add_self_loops=True)])
+            self.drug_layers.append(GATConv(in_channels_first=96 * 8, in_channels_second=prot_dim, out_channels=96, heads=8, dropout=0.3, add_self_loops=False))
+        self.prot_layers = nn.ModuleList([GATConv(in_channels_first=prot_dim, in_channels_second=drug_dim, out_channels=160, heads=8, dropout=0.2, add_self_loops=True)])
         for i in range(self.num_layers):
-            self.prot_layers.append(GATConv(in_channels_first= 160 * 8, in_channels_second=768, out_channels=160, heads=8, dropout=0.2, add_self_loops=True))
+            self.prot_layers.append(GATConv(in_channels_first=160 * 8, in_channels_second=drug_dim, out_channels=160, heads=8, dropout=0.2, add_self_loops=True))
         self.act = nn.ReLU()
-        self.gcn1 = LogitGCN(in_channels=-1, hidden_channels=256, out_channels=2)  
-        self.gcn2 = LogitGCN(in_channels=-1, hidden_channels=256, out_channels=2)  
+        self.gcn1 = LogitGCN(in_channels=drug_dim, hidden_channels=256, out_channels=2)
+        self.gcn2 = LogitGCN(in_channels=prot_dim, hidden_channels=256, out_channels=2)
 
     def forward(self, x_drug, edge_index_drug, x_protein, edge_index_protein):
 
@@ -378,7 +378,7 @@ class Net(pl.LightningModule):
         super().__init__()
 
         self.fold_idx = fold_idx
-        self.cross_gat = Cross_GAT()
+        self.cross_gat = Cross_GAT(network['drug_dim'], network['prot_dim'])
         self.drug_attn = []
         self.prot_attn = []
         self.nodes = 0

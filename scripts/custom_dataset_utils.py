@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from contextlib import contextmanager
@@ -30,13 +31,28 @@ class FilteredCustomData:
 
 def _inference_source_signature(path: Path, delimiter: str, has_header: bool) -> dict[str, Any]:
     stat = path.stat()
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {
         "path": str(path.resolve()),
         "size": stat.st_size,
-        "mtime_ns": stat.st_mtime_ns,
+        "sha256": digest.hexdigest(),
         "delimiter": delimiter,
         "has_header": has_header,
     }
+
+
+def _inference_source_matches(cached: dict[str, Any], current: dict[str, Any]) -> bool:
+    """Accept older manifests without treating a harmless mtime change as new input."""
+    stable_keys = ("size", "delimiter", "has_header")
+    if any(cached.get(key) != current.get(key) for key in stable_keys):
+        return False
+    cached_digest = cached.get("sha256")
+    if cached_digest is not None:
+        return cached_digest == current["sha256"]
+    return cached.get("path") == current["path"]
 
 
 def save_inference_preparation_manifest(
@@ -95,7 +111,8 @@ def load_cached_inference_preparation(
             if manifest.get("version") != INFERENCE_PREPARATION_CACHE_VERSION:
                 _emit(log_fn, "Prepared inference cache version changed; rebuilding")
                 return None
-            if manifest.get("source") != _inference_source_signature(input_path, delimiter, has_header):
+            current_source = _inference_source_signature(input_path, delimiter, has_header)
+            if not _inference_source_matches(manifest.get("source", {}), current_source):
                 _emit(log_fn, "Prepared inference cache does not match the current input; rebuilding")
                 return None
             for file_info in manifest.get("files", {}).values():
