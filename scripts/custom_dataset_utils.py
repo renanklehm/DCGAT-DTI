@@ -131,15 +131,20 @@ def load_cached_inference_preparation(
     _emit(log_fn, f"Reusing {cache_kind} prepared inference TSVs from {prepared_dir}")
     try:
         with _timed_step(log_fn, "Loading prepared inference TSVs"):
-            drug_table = pd.read_csv(drug_path, sep="\t", dtype=str)
-            protein_table = pd.read_csv(protein_path, sep="\t", dtype=str)
+            # Prepared tables contain domain text, not nullable spreadsheet data.
+            # In particular, "NA" is a valid canonical protein sequence. Pandas'
+            # default NA parser would turn it into NaN and make an otherwise valid
+            # relation look as though it referenced an unknown protein ID.
+            drug_table = pd.read_csv(drug_path, sep="\t", dtype=str, keep_default_na=False)
+            protein_table = pd.read_csv(protein_path, sep="\t", dtype=str, keep_default_na=False)
             relation_table = pd.read_csv(
                 relation_path,
                 sep="\t",
                 dtype={"Drug_ID": str, "Prot_ID": str, "label": int},
+                keep_default_na=False,
             )
             if excluded_path.is_file():
-                excluded = pd.read_csv(excluded_path, sep="\t")
+                excluded = pd.read_csv(excluded_path, sep="\t", keep_default_na=False)
             else:
                 excluded = pd.DataFrame(columns=["source_row", "reason", "SMILES", "SEQ", "label"])
 
