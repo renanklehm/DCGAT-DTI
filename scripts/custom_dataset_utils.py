@@ -316,31 +316,40 @@ def read_custom_triplets(path: Path, delimiter: str, has_header: bool) -> Filter
         raise ValueError(f"No data rows were found in {path}")
 
     if suffix in {".json", ".parquet"}:
-        expected_columns = {"smiles", "sequence", "activation"}
         lowered = {str(column).strip().lower(): column for column in frame.columns}
-        if not expected_columns.issubset(lowered):
-            raise ValueError(f"{suffix} input must contain columns named smiles, sequence, and activation.")
+        if {"smiles", "sequence", "activation"}.issubset(lowered):
+            selected = (lowered["smiles"], lowered["sequence"], lowered["activation"])
+        elif {"drug", "target", "label"}.issubset(lowered):
+            selected = (lowered["drug"], lowered["target"], lowered["label"])
+        else:
+            raise ValueError(
+                f"{suffix} input must contain smiles/sequence/activation or GSDTI Drug/Target/Label columns."
+            )
         frame = frame.rename(
             columns={
-                lowered["smiles"]: "SMILES",
-                lowered["sequence"]: "SEQ",
-                lowered["activation"]: "label",
+                selected[0]: "SMILES",
+                selected[1]: "SEQ",
+                selected[2]: "label",
             }
         )
         frame = frame[["SMILES", "SEQ", "label"]]
     else:
         if has_header:
             lowered = {str(column).strip().lower(): column for column in frame.columns}
-            expected_columns = {"smiles", "sequence", "activation"}
-            if not expected_columns.issubset(lowered):
+            if {"smiles", "sequence", "activation"}.issubset(lowered):
+                selected = (lowered["smiles"], lowered["sequence"], lowered["activation"])
+            elif {"drug", "target", "label"}.issubset(lowered):
+                selected = (lowered["drug"], lowered["target"], lowered["label"])
+            else:
                 raise ValueError(
-                    "CSV input with --has-header must contain columns named smiles, sequence, and activation."
+                    "CSV input with --has-header must contain smiles/sequence/activation "
+                    "or GSDTI Drug/Target/Label columns."
                 )
             frame = frame.rename(
                 columns={
-                    lowered["smiles"]: "SMILES",
-                    lowered["sequence"]: "SEQ",
-                    lowered["activation"]: "label",
+                    selected[0]: "SMILES",
+                    selected[1]: "SEQ",
+                    selected[2]: "label",
                 }
             )
             frame = frame[["SMILES", "SEQ", "label"]]

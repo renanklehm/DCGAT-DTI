@@ -319,6 +319,7 @@ ALL_EXPERIMENTS = DRUGBANK_BINDINGDB_EXPERIMENTS + FOLD_EXPERIMENTS
 SPLIT_STRATEGY_ALIASES = {
     "warm": "random",
     "random": "random",
+    "gsdti": "gsdti",
     "cold_drug": "cold_drug",
     "cold_target": "cold_target",
     "cold_full": "cold_full",

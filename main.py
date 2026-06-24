@@ -45,8 +45,10 @@ from scripts.custom_dataset_utils import (
 )
 from scripts.train_custom_dataset_and_export import (
     apply_explicit_training_overrides,
+    build_gsdti_aligned_dataset,
     build_training_overrides as build_custom_training_overrides,
     run_training_with_log,
+    load_gsdti_holdout_source_rows,
     save_split_table,
     split_assignments,
 )
@@ -133,9 +135,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--split-strategy",
-        choices=("warm", "random", "cold_drug", "cold_target", "cold_full"),
+        choices=("warm", "random", "gsdti", "cold_drug", "cold_target", "cold_full"),
         default="warm",
         help="Split strategy for custom training data.",
+    )
+    parser.add_argument(
+        "--gsdti-validation-size",
+        type=float,
+        default=0.10,
+        help=(
+            "GSDTI validation fraction to reconstruct when --split-strategy gsdti is used. "
+            "The original GSDTI command used 0.10."
+        ),
+    )
+    parser.add_argument(
+        "--gsdti-predictions",
+        type=Path,
+        default=None,
+        help=(
+            "Optional GSDTI validation prediction export (for example NPASS_predictions.parquet). "
+            "When provided, it is the authoritative realized holdout instead of seeded reconstruction."
+        ),
     )
     parser.add_argument(
         "--balanced",
@@ -324,6 +344,10 @@ def resolve_mode(args: argparse.Namespace) -> str:
 
 
 def validate_ratios(args: argparse.Namespace) -> None:
+    if args.split_strategy == "gsdti":
+        if not 0.0 < args.val_ratio < 1.0 - args.gsdti_validation_size:
+            raise ValueError("For a GSDTI split, --val-ratio must be positive and leave rows for training.")
+        return
     ratio_total = args.train_ratio + args.val_ratio + args.test_ratio
     if abs(ratio_total - 1.0) > 1e-9:
         raise ValueError("--train-ratio + --val-ratio + --test-ratio must sum to 1.0")
@@ -729,14 +753,35 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         args.reuse_custom_embeddings,
     )
 
-    dataset_for_training = utils.get_dataset(
-        cfg_dict,
-        x_drug_embeddings.copy(),
-        x_target_embeddings.copy(),
-        prepared["relations_with_source"][["Drug_ID", "Prot_ID", "label", "source_row"]].copy(),
-        ddi=None,
-        skipped=None,
-    )
+    relation_columns = ["Drug_ID", "Prot_ID", "label", "source_row"]
+    if args.split_strategy == "gsdti":
+        holdout_source_rows = None
+        if args.gsdti_predictions is not None:
+            holdout_source_rows = load_gsdti_holdout_source_rows(
+                prepared["filtered"].original,
+                args.gsdti_predictions,
+            )
+        dataset_for_training = build_gsdti_aligned_dataset(
+            x_drug_embeddings,
+            x_target_embeddings,
+            prepared["relations_with_source"][relation_columns],
+            prepared["filtered"].original,
+            gsdti_validation_size=args.gsdti_validation_size,
+            dcgat_validation_size=args.val_ratio,
+            seed=args.seed,
+            balanced=args.balanced,
+            unbalanced_ratio=args.unbalanced_ratio,
+            gsdti_holdout_source_rows=holdout_source_rows,
+        )
+    else:
+        dataset_for_training = utils.get_dataset(
+            cfg_dict,
+            x_drug_embeddings.copy(),
+            x_target_embeddings.copy(),
+            prepared["relations_with_source"][relation_columns].copy(),
+            ddi=None,
+            skipped=None,
+        )
 
     split_table_path = save_split_table(dataset_for_training, prepared_dir / "split_table.tsv")
     split_map = split_assignments(dataset_for_training)
@@ -805,6 +850,10 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
         "split_strategy": args.split_strategy,
         "balanced": args.balanced,
         "seed": args.seed,
+        "gsdti_validation_size": args.gsdti_validation_size if args.split_strategy == "gsdti" else None,
+        "gsdti_predictions": (
+            str(args.gsdti_predictions.resolve()) if args.gsdti_predictions is not None else None
+        ),
         "samples": sample_count,
         "excluded_rows": int(len(prepared["filtered"].excluded)),
         "positives": positive_count,
@@ -1446,6 +1495,10 @@ def main(argv: list[str] | None = None) -> None:
     args.serialized_dir.mkdir(parents=True, exist_ok=True)
 
     mode = resolve_mode(args)
+    if args.split_strategy == "gsdti" and mode != "custom_split_eval":
+        raise ValueError("--split-strategy gsdti is only valid with --train-data and no separate --test-data.")
+    if args.gsdti_predictions is not None and args.split_strategy != "gsdti":
+        raise ValueError("--gsdti-predictions requires --split-strategy gsdti.")
     if mode in {"custom_split_eval", "custom_cross_eval", "checkpoint_finetune"}:
         validate_ratios(args)
 

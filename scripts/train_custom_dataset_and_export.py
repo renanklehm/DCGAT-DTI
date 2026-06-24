@@ -138,6 +138,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoint_dir: Path) -> list[str]:
     best_param_name = args.best_param_name or default_best_param_name(args.split_strategy, args.balanced)
+    if args.split_strategy == "gsdti":
+        split_ratio = [
+            1.0 - args.gsdti_validation_size - args.val_ratio,
+            args.val_ratio,
+            args.gsdti_validation_size,
+        ]
+    else:
+        split_ratio = [args.train_ratio, args.val_ratio, args.test_ratio]
     overrides = [
         "tuning.param_search.tune=False",
         f"best_param_name={best_param_name}",
@@ -159,7 +167,7 @@ def build_training_overrides(args: argparse.Namespace, run_root: Path, checkpoin
         f"datamodule.splitting.balanced={'True' if args.balanced else 'False'}",
         f"datamodule.splitting.unbalanced_ratio={args.unbalanced_ratio}",
         f"datamodule.splitting.seed={args.seed}",
-        f"datamodule.splitting.ratio=[{args.train_ratio},{args.val_ratio},{args.test_ratio}]",
+        f"datamodule.splitting.ratio=[{split_ratio[0]},{split_ratio[1]},{split_ratio[2]}]",
     ]
     if args.max_epochs is not None:
         overrides.append(f"trainer.max_epochs={args.max_epochs}")
@@ -274,6 +282,156 @@ def split_assignments(dataset: dict[str, Any]):
         for source_row in dataset[split_name]["source_row"].tolist():
             assignments[int(source_row)] = split_name
     return pd.Series(assignments, name="split")
+
+
+def build_gsdti_aligned_dataset(
+    x_drug: Any,
+    x_target: Any,
+    relations_with_source: Any,
+    original_rows: Any,
+    *,
+    gsdti_validation_size: float,
+    dcgat_validation_size: float,
+    seed: int,
+    balanced: bool,
+    unbalanced_ratio: int,
+    gsdti_holdout_source_rows: Any = None,
+) -> dict[str, Any]:
+    """Recreate GSDTI's holdout first, then split DCGAT validation only from its training side."""
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+
+    if not 0.0 < gsdti_validation_size < 1.0:
+        raise ValueError("--gsdti-validation-size must be between 0 and 1")
+    if not 0.0 < dcgat_validation_size < 1.0 - gsdti_validation_size:
+        raise ValueError("--val-ratio must be positive and leave rows for DCGAT training")
+
+    all_source_rows = original_rows["source_row"].astype(int).to_numpy()
+    labels = original_rows["label"].astype(int).to_numpy()
+    stratify = labels if np.unique(labels).size > 1 else None
+    if gsdti_holdout_source_rows is None:
+        gsdti_train_rows, gsdti_test_rows = train_test_split(
+            all_source_rows,
+            test_size=gsdti_validation_size,
+            random_state=seed,
+            stratify=stratify,
+        )
+    else:
+        gsdti_test_rows = np.asarray(gsdti_holdout_source_rows, dtype=int)
+        if len(gsdti_test_rows) == 0 or len(np.unique(gsdti_test_rows)) != len(gsdti_test_rows):
+            raise ValueError("GSDTI prediction holdout rows must be non-empty and unique")
+        unknown_rows = np.setdiff1d(gsdti_test_rows, all_source_rows)
+        if len(unknown_rows):
+            raise ValueError(f"GSDTI prediction holdout references unknown source rows: {unknown_rows[:5].tolist()}")
+        gsdti_train_rows = np.setdiff1d(all_source_rows, gsdti_test_rows)
+
+    label_by_source = dict(zip(all_source_rows.tolist(), labels.tolist()))
+    gsdti_train_labels = np.asarray([label_by_source[int(row)] for row in gsdti_train_rows])
+    internal_validation_share = dcgat_validation_size / (1.0 - gsdti_validation_size)
+    train_rows, validation_rows = train_test_split(
+        gsdti_train_rows,
+        test_size=internal_validation_share,
+        random_state=seed + 1,
+        stratify=gsdti_train_labels if np.unique(gsdti_train_labels).size > 1 else None,
+    )
+
+    relations = relations_with_source.copy()
+    relations["indicator"] = 0
+    relations.loc[relations["source_row"].isin(train_rows), "indicator"] = 1
+    relations.loc[relations["source_row"].isin(validation_rows), "indicator"] = 2
+    relations.loc[relations["source_row"].isin(gsdti_test_rows), "indicator"] = 3
+    if (relations["indicator"] == 0).any():
+        raise RuntimeError("GSDTI-aligned split left filtered DCGAT rows unassigned")
+
+    x_drug = x_drug.copy()
+    x_target = x_target.copy()
+    x_drug["index"] = np.arange(len(x_drug))
+    x_target["index"] = np.arange(len(x_target))
+    relations["Drug_ID"] = relations["Drug_ID"].map(x_drug["index"])
+    relations["Prot_ID"] = relations["Prot_ID"].map(x_target["index"])
+    if relations[["Drug_ID", "Prot_ID"]].isna().any().any():
+        raise RuntimeError("GSDTI-aligned relations reference unknown drug or target IDs")
+    relations["Drug_ID"] = relations["Drug_ID"].astype(int)
+    relations["Prot_ID"] = relations["Prot_ID"].astype(int)
+    x_drug = x_drug.drop(columns="index")
+    x_target = x_target.drop(columns="index")
+
+    train = relations[relations["indicator"] == 1].copy()
+    validation = relations[relations["indicator"] == 2].copy()
+    test = relations[relations["indicator"] == 3].copy()
+    rng = np.random.RandomState(seed)
+    if balanced:
+        from utils.utils import new_balancing
+
+        train = new_balancing(train, rng=rng)
+    elif unbalanced_ratio:
+        from utils.utils import new_balancing
+
+        train = new_balancing(train, unbalanced_ratio, rng=rng)
+
+    if train.empty or validation.empty or test.empty:
+        raise ValueError(
+            "GSDTI-aligned splitting produced an empty train, validation, or test set after DCGAT filtering"
+        )
+    print(f"Number of samples in training: {len(train)}")
+    print(f"Number of samples in validation: {len(validation)}")
+    print(f"Number of samples in test: {len(test)}")
+    return {
+        "train": train,
+        "val": validation,
+        "test": test,
+        "X_drug": x_drug,
+        "X_target": x_target,
+        "ddi": None,
+    }
+
+
+def load_gsdti_holdout_source_rows(original_rows: Any, prediction_path: Path):
+    """Map GSDTI's realized validation prediction export back to canonical source rows."""
+    import pandas as pd
+
+    suffix = prediction_path.suffix.lower()
+    if suffix in {".parquet", ".pq"}:
+        predictions = pd.read_parquet(prediction_path)
+    elif suffix == ".csv":
+        predictions = pd.read_csv(prediction_path)
+    else:
+        raise ValueError("--gsdti-predictions must be a Parquet or CSV file")
+
+    required = {"smiles", "sequence", "real_value"}
+    missing = required - set(predictions.columns)
+    if missing:
+        raise ValueError(f"GSDTI predictions are missing required columns: {sorted(missing)}")
+    predicted_truth = predictions["real_value"].astype(float)
+    if set(predicted_truth.unique()).issubset({0.0, 1.0}):
+        prediction_labels = predicted_truth.astype(int)
+    else:
+        prediction_labels = (predicted_truth >= 0.0).astype(int)
+
+    canonical = original_rows[["source_row", "SMILES", "SEQ", "label"]].copy()
+    canonical["label"] = canonical["label"].astype(int)
+    holdout = pd.DataFrame(
+        {
+            "SMILES": predictions["smiles"].astype(str),
+            "SEQ": predictions["sequence"].astype(str),
+            "label": prediction_labels,
+        }
+    )
+    keys = ["SMILES", "SEQ", "label"]
+    occurrence = "_pair_occurrence"
+    canonical[occurrence] = canonical.groupby(keys, sort=False).cumcount()
+    holdout[occurrence] = holdout.groupby(keys, sort=False).cumcount()
+    matched = holdout.merge(
+        canonical[keys + [occurrence, "source_row"]],
+        on=keys + [occurrence],
+        how="left",
+        validate="one_to_one",
+        sort=False,
+    )
+    if matched["source_row"].isna().any():
+        examples = matched.loc[matched["source_row"].isna(), keys].head(5).to_dict("records")
+        raise ValueError(f"GSDTI prediction rows were not found in df_less1000.csv; examples: {examples}")
+    return matched["source_row"].astype(int).to_numpy()
 
 
 def save_split_table(dataset: dict[str, Any], output_path: Path) -> Path:

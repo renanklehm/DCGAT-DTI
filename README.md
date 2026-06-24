@@ -259,6 +259,27 @@ The exported predictions file keeps the same custom-data-oriented format as the 
 
 `cold_full` is stricter than `cold_drug` and `cold_target`: it holds out both a set of drugs and a set of proteins from training. Rows that mix different holdout partitions are marked as `unused` in the predictions export and are not used for train/val/test metrics.
 
+#### Align a DCGAT-DTI run to an existing GSDTI run
+
+Use GSDTI's prepared canonical interaction table, not the original raw input. The `gsdti` strategy first recreates GSDTI's stratified validation holdout with the same seed and then takes DCGAT-DTI's validation rows only from the GSDTI training side. The GSDTI holdout is never balanced or used for DCGAT-DTI training.
+
+```bash
+python main.py \
+  --train-data /workspace/Nintx/GSDTI/NPASS/df_less1000.csv \
+  --train-has-header \
+  --split-strategy gsdti \
+  --gsdti-predictions /workspace/Nintx/GSDTI/results/NPASS_predictions.parquet \
+  --gsdti-validation-size 0.10 \
+  --val-ratio 0.01 \
+  --seed 42 \
+  --balanced \
+  --artifacts-dir /workspace/Nintx/DCGAT-DTI/npass_gsdti_aligned \
+  --serialized-dir /workspace/Nintx/DCGAT-DTI \
+  --reuse-custom-embeddings
+```
+
+`df_less1000.csv` is accepted directly with its GSDTI `Drug`, `Target`, and `Label` columns. When `--gsdti-predictions` is supplied, that realized GSDTI validation export is authoritative; otherwise the holdout is reconstructed from the seed and validation size. Splitting is performed against the complete canonical row order before DCGAT-DTI-specific exclusions are applied, so excluded rows cannot shift the holdout. The resulting `prepared_data/split_table.tsv` is the audit record for the actual rows used by DCGAT-DTI.
+
 ### 3. Train on one custom dataset and test on another custom dataset
 
 This new workflow trains with the same built-in balancing and split modes, but evaluates on a separate custom file.
