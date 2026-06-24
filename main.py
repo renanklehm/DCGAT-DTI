@@ -740,6 +740,15 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
 
     prepared, train_export_path = prepare_training_dataset(args, prepared_dir)
 
+    gsdti_holdout_source_rows = None
+    if args.split_strategy == "gsdti" and args.gsdti_predictions is not None:
+        # Resolve and validate the realized holdout before expensive embedding work.
+        gsdti_holdout_source_rows = load_gsdti_holdout_source_rows(
+            prepared["filtered"].original,
+            args.gsdti_predictions,
+            expected_fraction=args.gsdti_validation_size,
+        )
+
     training_overrides = build_custom_training_overrides(args, run_root, checkpoint_dir)
     cfg = compose_cfg(base_config, training_overrides)
     cfg_dict = update_best_params(cfg)
@@ -759,12 +768,6 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
 
     relation_columns = ["Drug_ID", "Prot_ID", "label", "source_row"]
     if args.split_strategy == "gsdti":
-        holdout_source_rows = None
-        if args.gsdti_predictions is not None:
-            holdout_source_rows = load_gsdti_holdout_source_rows(
-                prepared["filtered"].original,
-                args.gsdti_predictions,
-            )
         dataset_for_training = build_gsdti_aligned_dataset(
             x_drug_embeddings,
             x_target_embeddings,
@@ -775,7 +778,7 @@ def run_custom_split_eval(args: argparse.Namespace, argv: list[str] | None) -> N
             seed=args.seed,
             balanced=args.balanced,
             unbalanced_ratio=args.unbalanced_ratio,
-            gsdti_holdout_source_rows=holdout_source_rows,
+            gsdti_holdout_source_rows=gsdti_holdout_source_rows,
         )
     else:
         dataset_for_training = utils.get_dataset(

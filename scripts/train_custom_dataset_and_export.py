@@ -38,6 +38,33 @@ DEFAULT_SERIALIZED_DIR = REPO_ROOT / "datasets" / "serialized"
 DEFAULT_ARTIFACTS_DIR = REPO_ROOT / "artifacts" / "custom_training"
 
 
+class TeeStream:
+    """Mirror writes to the live console and a durable log file."""
+
+    def __init__(self, console: Any, log: Any) -> None:
+        self.console = console
+        self.log = log
+
+    def write(self, text: str) -> int:
+        self.console.write(text)
+        self.log.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        self.console.flush()
+        self.log.flush()
+
+    def isatty(self) -> bool:
+        return self.console.isatty()
+
+    def fileno(self) -> int:
+        return self.console.fileno()
+
+    @property
+    def encoding(self) -> str | None:
+        return getattr(self.console, "encoding", None)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -262,9 +289,14 @@ def run_training_with_log(
         command.append(command_name)
     command.extend(argv or sys.argv[1:])
     with log_path.open("w", encoding="utf-8") as handle:
-        handle.write("COMMAND: " + shlex.join(command) + "\n\n")
+        command_line = "COMMAND: " + shlex.join(command) + "\n\n"
+        sys.stdout.write(command_line)
+        sys.stdout.flush()
+        handle.write(command_line)
         handle.flush()
-        with contextlib.redirect_stdout(handle), contextlib.redirect_stderr(handle):
+        stdout = TeeStream(sys.stdout, handle)
+        stderr = TeeStream(sys.stderr, handle)
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             train_custom_model(
                 cfg_dict,
                 dataset,
@@ -386,7 +418,12 @@ def build_gsdti_aligned_dataset(
     }
 
 
-def load_gsdti_holdout_source_rows(original_rows: Any, prediction_path: Path):
+def load_gsdti_holdout_source_rows(
+    original_rows: Any,
+    prediction_path: Path,
+    *,
+    expected_fraction: float | None = None,
+):
     """Map GSDTI's realized validation prediction export back to canonical source rows."""
     import pandas as pd
 
@@ -431,6 +468,22 @@ def load_gsdti_holdout_source_rows(original_rows: Any, prediction_path: Path):
     if matched["source_row"].isna().any():
         examples = matched.loc[matched["source_row"].isna(), keys].head(5).to_dict("records")
         raise ValueError(f"GSDTI prediction rows were not found in df_less1000.csv; examples: {examples}")
+    if len(matched) >= len(canonical):
+        raise ValueError(
+            f"GSDTI predictions contain {len(matched):,} rows for a {len(canonical):,}-row canonical dataset. "
+            "This is a full-dataset prediction export, not a held-out validation export. "
+            "Omit --gsdti-predictions to reconstruct the split from --seed and --gsdti-validation-size."
+        )
+    if expected_fraction is not None:
+        import math
+
+        expected_rows = math.ceil(len(canonical) * expected_fraction)
+        if len(matched) != expected_rows:
+            raise ValueError(
+                f"GSDTI predictions contain {len(matched):,} rows, but validation_size={expected_fraction} "
+                f"for {len(canonical):,} canonical rows implies {expected_rows:,}. "
+                "Use the validation-only GSDTI training export, or omit --gsdti-predictions for seeded reconstruction."
+            )
     return matched["source_row"].astype(int).to_numpy()
 
 

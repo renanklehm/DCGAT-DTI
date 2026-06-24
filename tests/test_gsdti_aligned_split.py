@@ -113,6 +113,32 @@ def test_gsdti_prediction_export_can_define_realized_holdout(tmp_path: Path) -> 
         }
     ).to_csv(predictions_path, index=False)
 
-    source_rows = load_gsdti_holdout_source_rows(original, predictions_path)
+    source_rows = load_gsdti_holdout_source_rows(original, predictions_path, expected_fraction=0.5)
 
     assert source_rows.tolist() == [1, 3]
+
+
+def test_full_dataset_prediction_export_is_rejected(tmp_path: Path) -> None:
+    original = pd.DataFrame(
+        {
+            "source_row": [0, 1],
+            "SMILES": ["CC", "CCC"],
+            "SEQ": ["ACDE", "FGHI"],
+            "label": [0, 1],
+        }
+    )
+    predictions_path = tmp_path / "full_predictions.csv"
+    pd.DataFrame(
+        {
+            "smiles": original["SMILES"],
+            "sequence": original["SEQ"],
+            "real_value": original["label"],
+        }
+    ).to_csv(predictions_path, index=False)
+
+    try:
+        load_gsdti_holdout_source_rows(original, predictions_path, expected_fraction=0.5)
+    except ValueError as exc:
+        assert "full-dataset prediction export" in str(exc)
+    else:
+        raise AssertionError("Expected a full GSDTI prediction export to be rejected")
