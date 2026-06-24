@@ -267,6 +267,7 @@ Use GSDTI's prepared canonical interaction table, not the original raw input. Th
 python main.py \
   --train-data /workspace/Nintx/GSDTI/NPASS/df_less1000.csv \
   --train-has-header \
+  --train-delimiter , \
   --split-strategy gsdti \
   --gsdti-predictions /workspace/Nintx/GSDTI/results/NPASS_predictions.parquet \
   --gsdti-validation-size 0.10 \

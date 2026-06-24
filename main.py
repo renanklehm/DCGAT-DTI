@@ -359,6 +359,10 @@ def resolve_base_config(args: argparse.Namespace) -> str:
 
 def resolve_delimiter(args: argparse.Namespace, kind: str) -> str:
     specific = getattr(args, f"{kind}_delimiter")
+    if kind == "train" and args.split_strategy == "gsdti" and specific is None:
+        # GSDTI's canonical df_less1000.csv is emitted with pandas' standard
+        # comma separator, while DCGAT-DTI's historical custom-data default is '|'.
+        return ","
     return args.delimiter if specific is None else specific
 
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,13 @@ from scripts.train_custom_dataset_and_export import (
     build_gsdti_aligned_dataset,
     load_gsdti_holdout_source_rows,
 )
+from main import resolve_delimiter
+
+
+def test_gsdti_training_defaults_to_comma_delimiter() -> None:
+    args = SimpleNamespace(split_strategy="gsdti", train_delimiter=None, delimiter="|")
+
+    assert resolve_delimiter(args, "train") == ","
 
 
 def test_read_custom_triplets_accepts_gsdti_canonical_table(tmp_path: Path) -> None:
