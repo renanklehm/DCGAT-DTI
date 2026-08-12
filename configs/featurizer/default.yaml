@@ -1,8 +1,11 @@
 drugfeaturizer:
   _target_: module.featurizer.drug_featurizer.chembert_featurizer.CHEMFEATURE
-  batch_size: 32
+  batch_size: 512
 
 protfeaturizer:
   _target_: module.featurizer.prot_featurizer.esm_featurizer.ESMFEATURE
-  batch_size: 4
+  # batch_size only caps the sequence count; attention_budget (B * L^2) is what
+  # actually governs memory. Lower attention_budget first if you hit OOM.
+  batch_size: 64
+  attention_budget: 50000000
 

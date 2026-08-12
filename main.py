@@ -221,13 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--drug-embed-batch-size",
         type=int,
-        default=32,
+        default=512,
         help="Batch size for SMILES embedding generation.",
     )
     parser.add_argument(
         "--target-embed-batch-size",
         type=int,
-        default=4,
+        default=64,
         help="Batch size for protein embedding generation.",
     )
     parser.add_argument(
@@ -1481,7 +1481,7 @@ def run_neo4j_inference(args: argparse.Namespace) -> None:
                 model = load_prediction_model(cfg_dict, checkpoint_path, dataset)
             predictions = predict_checkpoint_on_dataset(
                 cfg_dict, checkpoint_path, dataset, relation_table["source_row"].tolist(),
-                progress_desc="Neo4j inference", model=model,
+                progress_desc="Neo4j inference", model=model, show_progress=False,
             )
             probabilities = predictions["probability_active"].tolist()
             rows = [

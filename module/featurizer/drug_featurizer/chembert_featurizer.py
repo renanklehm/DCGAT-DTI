@@ -28,7 +28,8 @@ class CHEMFEATURE:
         data = [X_drug[i * batch_size:(i + 1) * batch_size] for i in range((len(X_drug) + batch_size - 1) // batch_size)]
 
         drug_representations = []
-        for temp_data in tqdm(data):
+        pbar = tqdm(total=len(X_drug), unit="mol", desc="ChemBERTa")
+        for temp_data in data:
             inputs = self.tokenizer(temp_data.tolist(), padding=True, truncation=True, max_length=self.max_length, return_tensors="pt").to(self.device)
             batch_lens = (inputs['attention_mask'] != 0).sum(1)
 
@@ -43,6 +44,8 @@ class CHEMFEATURE:
                 drug_representations.append(token_representations[i, 1 : tokens_len - 1].mean(0).cpu())
 
             del outputs, token_representations, inputs
+            pbar.update(len(temp_data))
+        pbar.close()
 
         #  print((drug_representations))
         drug_representations = torch.stack(drug_representations)

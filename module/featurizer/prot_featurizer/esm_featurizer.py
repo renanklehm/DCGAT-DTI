@@ -115,19 +115,25 @@ class ESMFEATURE:
         batches = self._make_batches(order, lengths)
 
         representations = {}
-        for indices in tqdm(batches):
-            pending = [indices]
-            while pending:
-                chunk = pending.pop()
-                try:
-                    representations.update(self._embed(chunk, X_target))
-                except torch.cuda.OutOfMemoryError:
-                    if len(chunk) == 1:
-                        raise
-                    # Budget was still too optimistic for this length; split and retry.
-                    torch.cuda.empty_cache()
-                    mid = len(chunk) // 2
-                    pending.extend([chunk[:mid], chunk[mid:]])
+        # Batches hold wildly different numbers of sequences, so the bar counts
+        # proteins rather than batches to stay a meaningful progress estimate.
+        with tqdm(total=len(X_target), unit="prot", desc="ESM-2") as pbar:
+            for indices in batches:
+                pending = [indices]
+                while pending:
+                    chunk = pending.pop()
+                    try:
+                        representations.update(self._embed(chunk, X_target))
+                    except torch.cuda.OutOfMemoryError:
+                        if len(chunk) == 1:
+                            raise
+                        # Budget was still too optimistic for this length; split and retry.
+                        torch.cuda.empty_cache()
+                        mid = len(chunk) // 2
+                        pending.extend([chunk[:mid], chunk[mid:]])
+                    else:
+                        pbar.update(len(chunk))
+                pbar.set_postfix(len=lengths[indices[-1]], bs=len(indices))
 
         #use torch stack to convert list of tensors to tensor
         sequence_representations = torch.stack([representations[i] for i in range(len(X_target))])

@@ -817,6 +817,7 @@ def predict_checkpoint_on_dataset(
     progress_desc: str = "Predicting",
     log_fn: Any | None = None,
     model: Any | None = None,
+    show_progress: bool = True,
 ) -> pd.DataFrame:
     import pandas as pd
     import torch
@@ -852,7 +853,7 @@ def predict_checkpoint_on_dataset(
         tqdm = None
 
     batches = dataloader
-    if tqdm is not None:
+    if tqdm is not None and show_progress:
         batches = tqdm(dataloader, desc=progress_desc, unit="batch")
 
     with torch.no_grad():
