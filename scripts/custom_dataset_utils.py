@@ -792,22 +792,10 @@ def export_checkpoint_to_safetensors(checkpoint_path: Path, output_path: Path, m
     save_file(cpu_state_dict, str(output_path), metadata=metadata)
 
 
-def predict_checkpoint_on_dataset(
-    cfg_dict: dict[str, Any],
-    checkpoint_path: Path,
-    dataset: dict[str, pd.DataFrame],
-    source_rows: list[int],
-    progress_desc: str = "Predicting",
-    log_fn: Any | None = None,
-) -> pd.DataFrame:
-    import pandas as pd
-    import torch
-
-    from datamodule.dataloader_GAT import MyDataset
+def load_prediction_model(cfg_dict: dict[str, Any], checkpoint_path: Path, dataset: dict[str, Any]):
+    """Load a checkpoint once so callers can score many bounded relation batches."""
     from module.cognn_cross import Net
 
-    if log_fn is not None:
-        log_fn(f"Loading checkpoint: {checkpoint_path}")
     model = Net.load_from_checkpoint(
         str(checkpoint_path),
         cfg=cfg_dict,
@@ -817,10 +805,27 @@ def predict_checkpoint_on_dataset(
         criterion=cfg_dict["module"]["criterion"],
         GAT_params=cfg_dict["module"]["GAT_params"],
     )
+    import torch
+    return model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu")).eval()
 
+
+def predict_checkpoint_on_dataset(
+    cfg_dict: dict[str, Any],
+    checkpoint_path: Path,
+    dataset: dict[str, pd.DataFrame],
+    source_rows: list[int],
+    progress_desc: str = "Predicting",
+    log_fn: Any | None = None,
+    model: Any | None = None,
+) -> pd.DataFrame:
+    import pandas as pd
+    import torch
+
+    from datamodule.dataloader_GAT import MyDataset
+    if log_fn is not None:
+        log_fn(f"Loading checkpoint: {checkpoint_path}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
-    model.eval()
+    model = load_prediction_model(cfg_dict, checkpoint_path, dataset) if model is None else model.to(device).eval()
     if log_fn is not None:
         log_fn(f"Using device: {device}")
 

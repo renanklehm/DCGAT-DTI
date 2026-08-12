@@ -33,6 +33,7 @@ from scripts.custom_dataset_utils import (
     ensure_prediction_runtime,
     export_checkpoint_to_safetensors,
     generate_custom_embeddings,
+    load_prediction_model,
     load_cached_inference_preparation,
     predict_checkpoint_on_dataset,
     read_inference_pairs,
@@ -74,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("reproduce-paper", "infer"),
+        choices=("reproduce-paper", "infer", "infer-neo4j"),
         help="Dedicated workflow command. Omit it to use the unified custom-data workflow.",
     )
     parser.add_argument("--scenario", help="Built-in scenario to train, in dataset:scenario_key form.")
@@ -95,6 +96,14 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Inference-only table containing smiles and sequence columns.",
     )
+    parser.add_argument("--smiles-json", type=Path, help="JSON array of canonical SMILES for infer-neo4j.")
+    parser.add_argument("--sequences-json", type=Path, help="JSON array of target sequences for infer-neo4j.")
+    parser.add_argument("--neo4j-config", type=Path, help="JSON with Neo4j uri, username, password, and optional database.")
+    parser.add_argument("--model-name", default="DCGAT-DTI", help="Value stored in ACTIVITY_PREDICTION.model.")
+    parser.add_argument("--pair-batch-size", type=int, default=1024, help="Maximum Cartesian pairs held for prediction.")
+    parser.add_argument("--write-batch-size", type=int, default=1024, help="Maximum prediction rows in one Neo4j UNWIND.")
+    parser.add_argument("--progress-file", type=Path, help="Resumable JSON progress checkpoint; defaults under --artifacts-dir.")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume the matching progress file (default: true).")
     parser.add_argument(
         "--output-csv",
         type=Path,
@@ -302,6 +311,13 @@ def resolve_mode(args: argparse.Namespace) -> str:
         if args.finetune_checkpoint is not None or args.resume_from_checkpoint is not None:
             raise ValueError("infer mode cannot be combined with finetuning or resume flags.")
         return "inference"
+
+    if args.command == "infer-neo4j":
+        if args.checkpoint is None or args.smiles_json is None or args.sequences_json is None or args.neo4j_config is None:
+            raise ValueError("infer-neo4j requires --checkpoint, --smiles-json, --sequences-json, and --neo4j-config.")
+        if args.inference_data is not None or args.scenario is not None or args.train_data is not None or args.test_data is not None:
+            raise ValueError("infer-neo4j cannot be combined with table inference or training inputs.")
+        return "neo4j_inference"
 
     if args.dataset_1 is not None:
         if args.train_data is not None:
@@ -1396,6 +1412,102 @@ def run_checkpoint_eval(args: argparse.Namespace) -> None:
     )
 
 
+def run_neo4j_inference(args: argparse.Namespace) -> None:
+    """Embed unique entities once, then stream the Cartesian product to Neo4j."""
+    import gc
+    import hashlib
+    import itertools
+    import pandas as pd
+
+    from neo4j_sink import Neo4jPredictionWriter, load_progress, read_json_string_list, save_progress
+
+    if args.pair_batch_size < 1 or args.write_batch_size < 1:
+        raise ValueError("--pair-batch-size and --write-batch-size must be at least 1.")
+    checkpoint_path = args.checkpoint.resolve()
+    ensure_prediction_runtime()
+    smiles = read_json_string_list(args.smiles_json, "SMILES")
+    sequences = read_json_string_list(args.sequences_json, "sequences")
+    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
+    # The existing feature pipeline needs a relation frame only to discover the
+    # two entity tables. Cycle the shorter list, keeping this setup O(N + M).
+    entity_count = max(len(smiles), len(sequences))
+    entity_frame = pd.DataFrame(
+        {
+            "SMILES": list(itertools.islice(itertools.cycle(smiles), entity_count)),
+            "SEQ": list(itertools.islice(itertools.cycle(sequences), entity_count)),
+            "label": 0,
+        }
+    )
+    tables = build_custom_tables(entity_frame)
+    entity_hash = hashlib.sha256(json.dumps([smiles, sequences], separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
+    suffix = sanitize_slug(f"neo4j_{checkpoint_path.stem}_{entity_hash}")
+    drug_name, target_name = custom_serializer_names(args.smiles_json, suffix)
+    x_drug, x_target, _ = generate_custom_embeddings(
+        cfg, tables, args.serialized_dir, drug_name, target_name, args.reuse_custom_embeddings
+    )
+    drug_ids = tables.X_drug.index.to_list()
+    target_ids = tables.X_target.index.to_list()
+    drug_id_by_smiles = dict(zip(tables.X_drug["SMILES"], drug_ids))
+    target_id_by_sequence = dict(zip(tables.X_target["SEQ"], target_ids))
+    total_pairs = len(smiles) * len(sequences)
+    fingerprint = hashlib.sha256(json.dumps([smiles, sequences, args.model_name, str(checkpoint_path)], separators=(",", ":")).encode()).hexdigest()
+    progress_path = args.progress_file or args.artifacts_dir / f"neo4j_{fingerprint[:12]}.progress.json"
+    progress = load_progress(progress_path, fingerprint, total_pairs, args.resume)
+    start_index = int(progress["next_pair_index"])
+    if not 0 <= start_index <= total_pairs:
+        raise ValueError(f"Invalid next_pair_index in progress file: {start_index}")
+    try:
+        from tqdm.auto import tqdm
+        bar = tqdm(total=total_pairs, initial=start_index, desc="DCGAT-DTI → Neo4j", unit="pair", dynamic_ncols=True)
+    except ModuleNotFoundError:
+        bar = None
+    start_drug, start_target = divmod(start_index, len(sequences))
+    pair_iter = ((smiles[drug_index], sequences[target_index]) for drug_index in range(start_drug, len(smiles)) for target_index in range(start_target if drug_index == start_drug else 0, len(sequences)))
+    model = None
+    uploaded = start_index
+    print(f"Streaming {total_pairs:,} DCGAT-DTI pairs from {start_index:,}; progress file: {progress_path}")
+    with Neo4jPredictionWriter(args.neo4j_config) as writer:
+        while pair_batch := list(itertools.islice(pair_iter, args.pair_batch_size)):
+            relation_table = pd.DataFrame(
+                {
+                    "Drug_ID": [drug_id_by_smiles[drug] for drug, _ in pair_batch],
+                    "Prot_ID": [target_id_by_sequence[target] for _, target in pair_batch],
+                    "label": 0,
+                    "source_row": range(len(pair_batch)),
+                }
+            )
+            dataset = build_prediction_dataset(x_drug, x_target, relation_table)
+            if model is None:
+                model = load_prediction_model(cfg_dict, checkpoint_path, dataset)
+            predictions = predict_checkpoint_on_dataset(
+                cfg_dict, checkpoint_path, dataset, relation_table["source_row"].tolist(),
+                progress_desc="Neo4j inference", model=model,
+            )
+            probabilities = predictions["probability_active"].tolist()
+            rows = [
+                {"smiles": pair[0], "sequence": pair[1], "model": args.model_name, "probability": float(probability)}
+                for pair, probability in zip(pair_batch, probabilities, strict=True)
+            ]
+            for offset in range(0, len(rows), args.write_batch_size):
+                row_batch = rows[offset : offset + args.write_batch_size]
+                writer.write(row_batch)
+                uploaded += len(row_batch)
+                progress["next_pair_index"] = uploaded
+                save_progress(progress_path, progress)
+                if bar is not None:
+                    bar.update(len(row_batch))
+            del relation_table, dataset, predictions, rows, pair_batch
+            gc.collect()
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except ModuleNotFoundError:
+                pass
+    if bar is not None:
+        bar.close()
+
+
 def run_inference(args: argparse.Namespace) -> None:
     checkpoint_path = args.checkpoint.resolve()
     input_path = args.inference_data.resolve()
@@ -1526,6 +1638,9 @@ def main(argv: list[str] | None = None) -> None:
         return
     if mode == "inference":
         run_inference(args)
+        return
+    if mode == "neo4j_inference":
+        run_neo4j_inference(args)
         return
 
     raise RuntimeError(f"Unsupported workflow mode: {mode}")
