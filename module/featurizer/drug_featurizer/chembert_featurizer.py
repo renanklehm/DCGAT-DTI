@@ -14,6 +14,11 @@ class CHEMFEATURE:
         self.tokenizer = AutoTokenizer.from_pretrained("seyonec/PubChem10M_SMILES_BPE_450k")
         self.device = device
         self.batch_size = batch_size
+        # The checkpoint ships no model_max_length, so `truncation=True` silently
+        # does nothing and long SMILES blow past the 512 position embeddings.
+        # RoBERTa reserves 2 positions for the padding offset.
+        self.max_length = min(512, self.model.config.max_position_embeddings - 2)
+        self.tokenizer.model_max_length = self.max_length
 
     def get_representations(self, X_drug):
 
@@ -24,7 +29,7 @@ class CHEMFEATURE:
 
         drug_representations = []
         for temp_data in tqdm(data):
-            inputs = self.tokenizer(temp_data.tolist(), padding=True, truncation=True, return_tensors="pt").to(self.device)
+            inputs = self.tokenizer(temp_data.tolist(), padding=True, truncation=True, max_length=self.max_length, return_tensors="pt").to(self.device)
             batch_lens = (inputs['attention_mask'] != 0).sum(1)
 
             #return hidden representations
