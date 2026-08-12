@@ -221,13 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--drug-embed-batch-size",
         type=int,
-        default=512,
+        default=32,
         help="Batch size for SMILES embedding generation.",
     )
     parser.add_argument(
         "--target-embed-batch-size",
         type=int,
-        default=64,
+        default=4,
         help="Batch size for protein embedding generation.",
     )
     parser.add_argument(
