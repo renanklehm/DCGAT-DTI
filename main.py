@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=("reproduce-paper", "infer", "infer-neo4j"),
+        choices=("reproduce-paper", "prepare-batch-tables", "infer", "batch-predict"),
         help="Dedicated workflow command. Omit it to use the unified custom-data workflow.",
     )
     parser.add_argument("--scenario", help="Built-in scenario to train, in dataset:scenario_key form.")
@@ -96,13 +96,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Inference-only table containing smiles and sequence columns.",
     )
-    parser.add_argument("--smiles-json", type=Path, help="JSON array of canonical SMILES for infer-neo4j.")
-    parser.add_argument("--sequences-json", type=Path, help="JSON array of target sequences for infer-neo4j.")
-    parser.add_argument("--neo4j-config", type=Path, help="JSON with Neo4j uri, username, password, and optional database.")
-    parser.add_argument("--model-name", default="DCGAT-DTI", help="Value stored in ACTIVITY_PREDICTION.model.")
-    parser.add_argument("--pair-batch-size", type=int, default=1024, help="Maximum Cartesian pairs held for prediction.")
-    parser.add_argument("--write-batch-size", type=int, default=1024, help="Maximum prediction rows in one Neo4j UNWIND.")
-    parser.add_argument("--progress-file", type=Path, help="Resumable JSON progress checkpoint; defaults under --artifacts-dir.")
+    parser.add_argument(
+        "--substances-parquet",
+        type=Path,
+        help="Parquet table with substance_id (int) and smiles (string) columns, for batch-predict.",
+    )
+    parser.add_argument(
+        "--targets-parquet",
+        type=Path,
+        help="Parquet table with target_id (int) and sequence (string) columns, for batch-predict.",
+    )
+    parser.add_argument("--pair-batch-size", type=int, default=1024, help="Maximum Cartesian pairs scored in one model forward pass.")
+    parser.add_argument(
+        "--chunk-rows",
+        type=int,
+        default=20_000_000,
+        help="Prediction rows per output Parquet chunk file for batch-predict.",
+    )
+    parser.add_argument(
+        "--probability-dtype",
+        choices=("float16", "float32"),
+        default="float16",
+        help="Storage dtype for the probability column in batch-predict output chunks.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for batch-predict chunk Parquet files; defaults under --artifacts-dir.",
+    )
+    parser.add_argument("--progress-file", type=Path, help="Resumable JSON progress checkpoint; defaults under --output-dir.")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume the matching progress file (default: true).")
     parser.add_argument(
         "--output-csv",
@@ -312,12 +334,12 @@ def resolve_mode(args: argparse.Namespace) -> str:
             raise ValueError("infer mode cannot be combined with finetuning or resume flags.")
         return "inference"
 
-    if args.command == "infer-neo4j":
-        if args.checkpoint is None or args.smiles_json is None or args.sequences_json is None or args.neo4j_config is None:
-            raise ValueError("infer-neo4j requires --checkpoint, --smiles-json, --sequences-json, and --neo4j-config.")
+    if args.command == "batch-predict":
+        if args.checkpoint is None or args.substances_parquet is None or args.targets_parquet is None:
+            raise ValueError("batch-predict requires --checkpoint, --substances-parquet, and --targets-parquet.")
         if args.inference_data is not None or args.scenario is not None or args.train_data is not None or args.test_data is not None:
-            raise ValueError("infer-neo4j cannot be combined with table inference or training inputs.")
-        return "neo4j_inference"
+            raise ValueError("batch-predict cannot be combined with table inference or training inputs.")
+        return "batch_predict"
 
     if args.dataset_1 is not None:
         if args.train_data is not None:
@@ -1412,100 +1434,158 @@ def run_checkpoint_eval(args: argparse.Namespace) -> None:
     )
 
 
-def run_neo4j_inference(args: argparse.Namespace) -> None:
-    """Embed unique entities once, then stream the Cartesian product to Neo4j."""
+def run_batch_predict(args: argparse.Namespace) -> None:
+    """Embed unique substances/targets once, then score the Cartesian product in resumable Parquet chunks."""
     import gc
     import hashlib
     import itertools
+
+    import numpy as np
     import pandas as pd
+    import pyarrow.parquet as pq
 
-    from neo4j_sink import Neo4jPredictionWriter, load_progress, read_json_string_list, save_progress
-
-    if args.pair_batch_size < 1 or args.write_batch_size < 1:
-        raise ValueError("--pair-batch-size and --write-batch-size must be at least 1.")
-    checkpoint_path = args.checkpoint.resolve()
-    ensure_prediction_runtime()
-    smiles = read_json_string_list(args.smiles_json, "SMILES")
-    sequences = read_json_string_list(args.sequences_json, "sequences")
-    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
-    # The existing feature pipeline needs a relation frame only to discover the
-    # two entity tables. Cycle the shorter list, keeping this setup O(N + M).
-    entity_count = max(len(smiles), len(sequences))
-    entity_frame = pd.DataFrame(
-        {
-            "SMILES": list(itertools.islice(itertools.cycle(smiles), entity_count)),
-            "SEQ": list(itertools.islice(itertools.cycle(sequences), entity_count)),
-            "label": 0,
-        }
+    from scripts.batch_predict_utils import (
+        chunk_path,
+        hash_file,
+        load_progress,
+        pair_stream,
+        save_progress,
+        write_prediction_chunk,
     )
-    tables = build_custom_tables(entity_frame)
-    entity_hash = hashlib.sha256(json.dumps([smiles, sequences], separators=(",", ":")).encode("utf-8")).hexdigest()[:12]
-    suffix = sanitize_slug(f"neo4j_{checkpoint_path.stem}_{entity_hash}")
-    drug_name, target_name = custom_serializer_names(args.smiles_json, suffix)
+    from scripts.custom_dataset_utils import CustomDatasetTables
+
+    if args.pair_batch_size < 1:
+        raise ValueError("--pair-batch-size must be at least 1.")
+    if args.chunk_rows < args.pair_batch_size:
+        raise ValueError("--chunk-rows must be at least --pair-batch-size.")
+
+    checkpoint_path = args.checkpoint.resolve()
+    substances_path = args.substances_parquet.resolve()
+    targets_path = args.targets_parquet.resolve()
+    ensure_prediction_runtime()
+
+    substances = pq.read_table(substances_path).to_pandas().sort_values("substance_id").reset_index(drop=True)
+    targets = pq.read_table(targets_path).to_pandas().sort_values("target_id").reset_index(drop=True)
+    if not np.array_equal(substances["substance_id"].to_numpy(), np.arange(len(substances))):
+        raise ValueError("substances parquet must have contiguous ids 0..N-1; regenerate it with prepare-batch-tables.")
+    if not np.array_equal(targets["target_id"].to_numpy(), np.arange(len(targets))):
+        raise ValueError("targets parquet must have contiguous ids 0..N-1; regenerate it with prepare-batch-tables.")
+
+    cfg, cfg_dict = load_or_compose_checkpoint_cfg(args, checkpoint_path)
+
+    tables = CustomDatasetTables(
+        X_drug=substances.set_index("substance_id")[["smiles"]].rename(columns={"smiles": "SMILES"}),
+        X_target=targets.set_index("target_id")[["sequence"]].rename(columns={"sequence": "SEQ"}),
+        DTI=pd.DataFrame(columns=["Drug_ID", "Prot_ID", "label"]),
+    )
+    entity_hash = hashlib.sha256(f"{hash_file(substances_path)}:{hash_file(targets_path)}".encode()).hexdigest()[:12]
+    suffix = sanitize_slug(f"batch_{checkpoint_path.stem}_{entity_hash}")
+    drug_name, target_name = custom_serializer_names(substances_path, suffix)
     x_drug, x_target, _ = generate_custom_embeddings(
         cfg, tables, args.serialized_dir, drug_name, target_name, args.reuse_custom_embeddings
     )
-    drug_ids = tables.X_drug.index.to_list()
-    target_ids = tables.X_target.index.to_list()
-    drug_id_by_smiles = dict(zip(tables.X_drug["SMILES"], drug_ids))
-    target_id_by_sequence = dict(zip(tables.X_target["SEQ"], target_ids))
-    total_pairs = len(smiles) * len(sequences)
-    fingerprint = hashlib.sha256(json.dumps([smiles, sequences, args.model_name, str(checkpoint_path)], separators=(",", ":")).encode()).hexdigest()
-    progress_path = args.progress_file or args.artifacts_dir / f"neo4j_{fingerprint[:12]}.progress.json"
+
+    num_substances = len(x_drug)
+    num_targets = len(x_target)
+    total_pairs = num_substances * num_targets
+
+    output_dir = args.output_dir or (args.artifacts_dir / "batch_predict" / suffix)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_chunks = -(-total_pairs // args.chunk_rows)
+    digits = max(5, len(str(total_chunks)))
+
+    fingerprint = hashlib.sha256(
+        f"{entity_hash}:{checkpoint_path}:{args.chunk_rows}:{args.probability_dtype}".encode()
+    ).hexdigest()
+    progress_path = args.progress_file or output_dir / "progress.json"
     progress = load_progress(progress_path, fingerprint, total_pairs, args.resume)
     start_index = int(progress["next_pair_index"])
+    chunk_index = int(progress["next_chunk_index"])
     if not 0 <= start_index <= total_pairs:
         raise ValueError(f"Invalid next_pair_index in progress file: {start_index}")
+
     try:
         from tqdm.auto import tqdm
-        bar = tqdm(total=total_pairs, initial=start_index, desc="DCGAT-DTI → Neo4j", unit="pair", dynamic_ncols=True)
+        bar = tqdm(total=total_pairs, initial=start_index, desc="DCGAT-DTI batch-predict", unit="pair", dynamic_ncols=True)
     except ModuleNotFoundError:
         bar = None
-    start_drug, start_target = divmod(start_index, len(sequences))
-    pair_iter = ((smiles[drug_index], sequences[target_index]) for drug_index in range(start_drug, len(smiles)) for target_index in range(start_target if drug_index == start_drug else 0, len(sequences)))
+
+    pair_iter = pair_stream(start_index, num_substances, num_targets)
     model = None
-    uploaded = start_index
-    print(f"Streaming {total_pairs:,} DCGAT-DTI pairs from {start_index:,}; progress file: {progress_path}")
-    with Neo4jPredictionWriter(args.neo4j_config) as writer:
-        while pair_batch := list(itertools.islice(pair_iter, args.pair_batch_size)):
-            relation_table = pd.DataFrame(
-                {
-                    "Drug_ID": [drug_id_by_smiles[drug] for drug, _ in pair_batch],
-                    "Prot_ID": [target_id_by_sequence[target] for _, target in pair_batch],
-                    "label": 0,
-                    "source_row": range(len(pair_batch)),
-                }
-            )
-            dataset = build_prediction_dataset(x_drug, x_target, relation_table)
-            if model is None:
-                model = load_prediction_model(cfg_dict, checkpoint_path, dataset)
-            predictions = predict_checkpoint_on_dataset(
-                cfg_dict, checkpoint_path, dataset, relation_table["source_row"].tolist(),
-                progress_desc="Neo4j inference", model=model, show_progress=False,
-            )
-            probabilities = predictions["probability_active"].tolist()
-            rows = [
-                {"smiles": pair[0], "sequence": pair[1], "model": args.model_name, "probability": float(probability)}
-                for pair, probability in zip(pair_batch, probabilities, strict=True)
-            ]
-            for offset in range(0, len(rows), args.write_batch_size):
-                row_batch = rows[offset : offset + args.write_batch_size]
-                writer.write(row_batch)
-                uploaded += len(row_batch)
-                progress["next_pair_index"] = uploaded
-                save_progress(progress_path, progress)
-                if bar is not None:
-                    bar.update(len(row_batch))
-            del relation_table, dataset, predictions, rows, pair_batch
-            gc.collect()
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except ModuleNotFoundError:
+    processed = start_index
+    print(f"Scoring {total_pairs:,} pairs from {start_index:,}; chunks -> {output_dir}; progress: {progress_path}")
+
+    while processed < total_pairs:
+        target_chunk_path = chunk_path(output_dir, chunk_index, digits)
+        chunk_end = min(processed + args.chunk_rows, total_pairs)
+        rows_needed = chunk_end - processed
+
+        if args.resume and target_chunk_path.exists():
+            # A previous run finished this chunk but the progress file was not updated afterward.
+            for _ in itertools.islice(pair_iter, rows_needed):
                 pass
+            if bar is not None:
+                bar.update(rows_needed)
+        else:
+            substance_buffer = np.empty(rows_needed, dtype=np.int32)
+            target_buffer = np.empty(rows_needed, dtype=np.int32)
+            label_buffer = np.empty(rows_needed, dtype=np.int8)
+            probability_buffer = np.empty(rows_needed, dtype=np.float32)
+            filled = 0
+
+            while filled < rows_needed:
+                pair_batch = list(itertools.islice(pair_iter, min(args.pair_batch_size, rows_needed - filled)))
+                relation_table = pd.DataFrame(
+                    {
+                        "Drug_ID": [substance_id for substance_id, _ in pair_batch],
+                        "Prot_ID": [target_id for _, target_id in pair_batch],
+                        "label": 0,
+                        "source_row": range(len(pair_batch)),
+                    }
+                )
+                dataset = build_prediction_dataset(x_drug, x_target, relation_table)
+                if model is None:
+                    model = load_prediction_model(cfg_dict, checkpoint_path, dataset)
+                predictions = predict_checkpoint_on_dataset(
+                    cfg_dict, checkpoint_path, dataset, relation_table["source_row"].tolist(),
+                    model=model, show_progress=False,
+                )
+                batch_len = len(pair_batch)
+                substance_buffer[filled : filled + batch_len] = [substance_id for substance_id, _ in pair_batch]
+                target_buffer[filled : filled + batch_len] = [target_id for _, target_id in pair_batch]
+                probability_buffer[filled : filled + batch_len] = predictions["probability_active"].to_numpy()
+                label_buffer[filled : filled + batch_len] = predictions["predicted_label"].to_numpy()
+                filled += batch_len
+                if bar is not None:
+                    bar.update(batch_len)
+                del relation_table, dataset, predictions, pair_batch
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except ModuleNotFoundError:
+                    pass
+
+            write_prediction_chunk(
+                target_chunk_path,
+                substance_buffer,
+                target_buffer,
+                label_buffer,
+                probability_buffer,
+                probability_dtype=args.probability_dtype,
+            )
+            del substance_buffer, target_buffer, label_buffer, probability_buffer
+
+        processed = chunk_end
+        chunk_index += 1
+        progress["next_pair_index"] = processed
+        progress["next_chunk_index"] = chunk_index
+        save_progress(progress_path, progress)
+
     if bar is not None:
         bar.close()
+    print(f"Wrote {chunk_index:,} chunk file(s) to {output_dir}")
 
 
 def run_inference(args: argparse.Namespace) -> None:
@@ -1607,6 +1687,9 @@ def main(argv: list[str] | None = None) -> None:
     if argv[0] == "reproduce-paper":
         importlib.import_module("scripts.reproduce_paper").main(argv[1:])
         return
+    if argv[0] == "prepare-batch-tables":
+        importlib.import_module("scripts.prepare_batch_tables").main(argv[1:])
+        return
 
     args = parser.parse_args(argv)
     ensure_repo_on_path()
@@ -1639,8 +1722,8 @@ def main(argv: list[str] | None = None) -> None:
     if mode == "inference":
         run_inference(args)
         return
-    if mode == "neo4j_inference":
-        run_neo4j_inference(args)
+    if mode == "batch_predict":
+        run_batch_predict(args)
         return
 
     raise RuntimeError(f"Unsupported workflow mode: {mode}")

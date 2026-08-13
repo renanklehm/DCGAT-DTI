@@ -36,7 +36,6 @@ dependencies:
   - pip:
       - antlr4-python3-runtime==4.9.3
       - fair-esm==2.0.0
-      - neo4j>=5.0
       - hydra-core==1.3.2
       - omegaconf==2.3.0
       - ray[tune]==2.8.1
