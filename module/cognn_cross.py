@@ -233,7 +233,7 @@ class GATConv(MessagePassing):
         alpha_second = F.leaky_relu(alpha_second, self.negative_slope)
         maskbool = maskbool.unsqueeze(1).expand(-1, self.heads, -1)
         alpha_second = torch.softmax(alpha_second, dim=-1)  
-        alpha_second =  F.dropout(alpha_second , p=self.dropout)
+        alpha_second = F.dropout(alpha_second, p=self.dropout, training=self.training)
         alpha_second = alpha_second * maskbool
         cross = alpha_second
         x_second_graph_agg = torch.einsum('bhn,nhd->bhd', alpha_second, x_second_transformed) 
